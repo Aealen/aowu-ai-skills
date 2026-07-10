@@ -54,15 +54,14 @@ from typing import Any
 #  粗体判断（flags 位标记 + 字体名推断）
 # ═══════════════════════════════════════════════════════════════
 
-# 字体名本身是粗字面的（即使 flags 无 bold 位，视觉效果也是粗体）。
-# 实测发现：招标文件封面用方正小标宋（FZXBSJW），flags=4（衬线）无 bold 位，
-# 但字体本身就是粗标题字。黑体同理。
-# TODO(调优): 遇到新的粗字面字体继续扩充
+# 字体名明确标识为粗体变体的（字体名里含 bold/heavy/black）。
+# 注意：方正小标宋(FZXBSJW)、黑体(SimHei) 等是标题字体但不是粗体字体，
+# 不应强制推断为 bold——应尊重源 PDF 的 flags 值。
+# 只对字体名里明确含粗体标识的才推断。
 _BOLD_FONT_PATTERNS = (
-    "fzxbsjw", "fzxbs", "fzxiaobiaosong",  # 方正小标宋（标题用）
-    "simhei", "hei", "heiti",               # 黑体
-    "fzhei", "fzht",                        # 方正黑体
-    "bold", "heavy", "black",               # 字体名含 bold/heavy/black
+    "bold",     # TimesNewRomanPS-BoldMT, Arial-Bold 等
+    "heavy",
+    "black",
 )
 
 
@@ -70,8 +69,8 @@ def _is_bold(flags: int, font_name: str) -> bool:
     """
     判断 span 是否粗体。
     两级判断：
-      1. flags 位标记（bit4=16）—— 标准方式
-      2. 字体名推断 —— 粗字面字体（方正小标宋、黑体等）即使无 bold 位也视为粗体
+      1. flags 位标记（bit4=16）—— 标准方式，优先信任
+      2. 字体名推断 —— 仅当字体名明确含 bold/heavy/black 字样
     """
     if flags & (1 << 4):  # bit4(16)=粗体
         return True

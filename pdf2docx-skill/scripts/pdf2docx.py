@@ -152,7 +152,8 @@ def cmd_convert(args) -> None:
 
     # ── Step 4: DOCX 重建 ──
     from build_docx import build_docx
-    result_path = build_docx(merged_data, images_dir, str(output_path))
+    result_path = build_docx(merged_data, images_dir, str(output_path),
+                             pdf_path=str(pdf_path))
 
     # ── 清理中间产物（除非 --keep-work）──
     if not args.keep_work:
@@ -234,7 +235,8 @@ def cmd_build(args) -> None:
     """仅 DOCX 重建。"""
     from build_docx import build_docx
     merged_data = json.loads(Path(args.merged).read_text(encoding="utf-8"))
-    result = build_docx(merged_data, args.images_dir, args.output)
+    result = build_docx(merged_data, args.images_dir, args.output,
+                        pdf_path=getattr(args, 'pdf', None))
     print(json.dumps({"output": result}, ensure_ascii=False, indent=2))
 
 
