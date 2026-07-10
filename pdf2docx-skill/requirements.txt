@@ -1,0 +1,16 @@
+# PDF 转 DOCX Skill 依赖
+# Python 3.10+
+# 安装：uv pip install -r requirements.txt
+
+# MinerU 3.x —— 版面结构分析（标题层级、表格、图片、段落块类型）
+# 用 [core] 即可（pipeline backend，CPU 可跑）；[all] 含 VLM（需 GPU）
+mineru[core]==3.0.4
+
+# albumentations —— MinerU 3.0.4 [core] 打包遗漏的依赖，手动补
+albumentations
+
+# PyMuPDF —— 字符级样式提取（font/size/color/flags）
+PyMuPDF
+
+# python-docx —— DOCX 重建
+python-docx

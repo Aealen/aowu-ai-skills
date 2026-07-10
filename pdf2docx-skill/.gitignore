@@ -1,0 +1,31 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+
+# 转换中间产物
+_test_output/
+output/
+_pdf2docx_work_*/
+*_middle.json
+*_spans.json
+*_merged.json
+output.docx
+result.docx
+
+# Word 临时锁文件
+~$*.docx
+~$*.doc
+
+# 临时测试脚本（下划线前缀）
+scripts/_*.py
+
+# IDE
+.vscode/
+.idea/
+*.swp
+
+# OS
+.DS_Store
+Thumbs.db
