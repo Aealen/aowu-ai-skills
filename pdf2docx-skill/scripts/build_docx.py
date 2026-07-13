@@ -192,9 +192,11 @@ def _apply_paragraph_format(para, block: dict[str, Any] | None = None) -> None:
 
     pf = para.paragraph_format
     pf.space_before = Pt(0)
-    pf.space_after = Pt(0)
 
-    line_height = (block.get("_line_height") if block else None) or (block.get("_doc_line_height") if block else None)
+    line_height = (
+        (block.get("_line_height") if block else None) or
+        (block.get("_doc_line_height") if block else None)
+    )
     if line_height:
         pf.line_spacing = Pt(line_height)
 
@@ -282,6 +284,13 @@ def _apply_paragraph_format(para, block: dict[str, Any] | None = None) -> None:
             pf.first_line_indent = Pt(round(first_indent_pt))
         else:
             pf.first_line_indent = Pt(0)
+
+    # 段后间距：从同页下一个 block 的 Y 坐标差获取（与标题格式一致）
+    gap_after = block.get("_gap_after")
+    if gap_after is not None and gap_after > 0:
+        pf.space_after = Pt(round(gap_after))
+    else:
+        pf.space_after = Pt(0)
 
 
 def _apply_style(run, style: dict[str, Any] | None = None) -> None:
@@ -418,7 +427,10 @@ def _apply_title_format(para, level: int, block: dict | None = None) -> None:
     pf.space_before = Pt(0)
 
     # 行距
-    line_height = (block.get("_line_height") if block else None) or (block.get("_doc_line_height") if block else None)
+    line_height = (
+        (block.get("_line_height") if block else None) or
+        (block.get("_doc_line_height") if block else None)
+    )
     if line_height:
         pf.line_spacing_rule = WD_LINE_SPACING.EXACTLY
         pf.line_spacing = Pt(line_height)
@@ -604,83 +616,184 @@ def _extract_table_cell_texts(pymupdf_table) -> list[list[str]] | None:
         return None
 
 
+def _extract_table_cell_styles(
+    pymupdf_table, page,
+) -> list[list[list[dict[str, Any]]]]:
+    """
+    从 PDF dict 提取表格每个 cell 内所有 span 的样式（字体/字号/粗体/颜色）。
+
+    返回 cell_styles[r][c] = [span_data, ...]，与 _pymupdf_cells 尺寸平行。
+    每个 span_data: {"text", "font", "size", "bold", "italic", "color"}。
+
+    用于在 _fill_table_cells 中按 cell 实际 PDF 样式构建多 run 内容，
+    而非全表共用 block._style 一种样式。
+    """
+    d = page.get_text("dict")
+    cell_styles: list[list[list[dict[str, Any]]]] = []
+
+    for row in pymupdf_table.rows:
+        row_cells: list[list[dict[str, Any]]] = []
+        for cell_bbox in row.cells:
+            if not cell_bbox:
+                row_cells.append([])
+                continue
+            cx0, cy0, cx1, cy1 = cell_bbox
+            spans: list[dict[str, Any]] = []
+            for block in d.get("blocks", []):
+                if block.get("type") != 0:
+                    continue
+                for line in block.get("lines", []):
+                    for sp in line.get("spans", []):
+                        if not sp["text"].strip():
+                            continue
+                        bx = sp["bbox"]
+                        if not (cx0 - 3 <= bx[0] and bx[2] <= cx1 + 3 and
+                                cy0 - 3 <= bx[1] and bx[3] <= cy1 + 3):
+                            continue
+                        flags = sp.get("flags", 0)
+                        spans.append({
+                            "text": sp["text"],
+                            "font": sp.get("font", ""),
+                            "size": sp.get("size", 12),
+                            "bold": bool(flags & 16),
+                            "italic": bool(flags & 2),
+                            "color": sp.get("color", 0),
+                            "_y": bx[1],
+                            "_x": bx[0],
+                        })
+            # 排序：先按 y 排序，再按视觉行分组（y 差 < 5pt 归为同一行），
+            # 同一视觉行内按 x 坐标排序（从左到右）。
+            # 数字/英文和中文的 baseline 有 2-3pt 微小差异，不分组会导致顺序错乱
+            # （数字 baseline 略高，排到同行的中文前面）。
+            spans.sort(key=lambda s: s["_y"])
+            # 分组：相邻 span y 差 < 5pt 归为同一视觉行
+            grouped: list[list[dict[str, Any]]] = []
+            for sp in spans:
+                if grouped and abs(sp["_y"] - grouped[-1][-1]["_y"]) < 5:
+                    grouped[-1].append(sp)
+                else:
+                    grouped.append([sp])
+            # 每组内按 x 排序，然后展平
+            spans = [sp for group in grouped for sp in sorted(group, key=lambda s: s["_x"])]
+            row_cells.append(spans)
+        cell_styles.append(row_cells)
+
+    return cell_styles
+
+
+def _extract_table_row_geometry(
+    pymupdf_table, page,
+) -> tuple[list[float], float | None, list[float | None]]:
+    """
+    从 PyMuPDF Table 对象提取每行高度和表格内文字行高。
+
+    参数：
+        pymupdf_table: PyMuPDF Table 对象（find_tables 返回）
+        page: 所属的 fitz.Page 对象
+
+    返回 (row_heights, text_line_height, row_line_heights)：
+      - row_heights: 每行的高度(pt)，用于设置 DOCX trHeight
+      - text_line_height: 表格内文字的行间距中位数(pt)，全局兜底
+      - row_line_heights: 每行的文字行间距(pt)，与 row_heights 平行。
+        用于按行精确设置 cell 段落行距。单行内容时为 None。
+    """
+    row_heights: list[float] = []
+    row_line_heights: list[float | None] = []
+    all_text_gaps: list[float] = []
+    d = page.get_text("dict")
+    for row in pymupdf_table.rows:
+        row_h = row.bbox[3] - row.bbox[1]
+        # 2% 微缩：补偿 DOCX 渲染与 PDF 的微小差异，控制总页数
+        scaled_h = row_h * 0.98
+        row_heights.append(round(scaled_h, 1))
+
+        ry0, ry1 = row.bbox[1], row.bbox[3]
+
+        # 按列分组收集 y0s：同一列内的 y0 差值才是行间距，
+        # 不同列之间的 y0 差（如 col0 "1.6" 和 col1 "是否允许..."）应忽略。
+        col_y0s: dict[int, list[float]] = {}
+        for ci, cell_bbox in enumerate(row.cells):
+            if not cell_bbox:
+                continue
+            cx0, _, cx1, _ = cell_bbox
+            y0s = []
+            for block in d.get("blocks", []):
+                if block.get("type") != 0:
+                    continue
+                for line in block.get("lines", []):
+                    spans = [sp for sp in line.get("spans", []) if sp["text"].strip()]
+                    if not spans:
+                        continue
+                    ly0 = line["bbox"][1]
+                    lx0 = line["bbox"][0]
+                    if (ry0 - 3 <= ly0 <= ry1 + 3 and
+                            cx0 - 3 <= lx0 <= cx1 + 3):
+                        y0s.append(ly0)
+            y0s.sort()
+            col_y0s[ci] = y0s
+
+        # 该行的最大文字行数（取所有列中行数最多的）
+        max_text_lines = max((len(y0s) for y0s in col_y0s.values()), default=0)
+
+        # 收集同列内连续 y0 差值作为行间距参考
+        row_gaps = []
+        for y0s in col_y0s.values():
+            for i in range(1, len(y0s)):
+                gap = y0s[i] - y0s[i - 1]
+                if 5 < gap < 40:
+                    row_gaps.append(round(gap, 1))
+                    all_text_gaps.append(round(gap, 1))
+
+        # 行间距：取 min(文字间距中位数, 行高/(文字行数+0.3))
+        # 分母 +0.3 给 cell 上下内边距留余量，避免 exact 模式下
+        # N行×line_spacing 恰好等于 trHeight 时最后一行被裁剪
+        gap_median = 0.0
+        if row_gaps:
+            row_gaps.sort()
+            gap_median = row_gaps[len(row_gaps) // 2]
+
+        if max_text_lines >= 1:
+            # line_spacing = scaled_h / (行数+0.5)，+0.5 给 cell 上下内边距留余量，
+            # 避免 exact 模式下 N行×line_spacing 恰好等于 trHeight 时最后一行被裁剪
+            by_height = round(scaled_h / (max_text_lines + 0.5), 1)
+            if gap_median > 0:
+                row_line_heights.append(min(gap_median, by_height))
+            else:
+                row_line_heights.append(by_height)
+        else:
+            row_line_heights.append(None)
+
+    text_lh = None
+    if all_text_gaps:
+        all_text_gaps.sort()
+        text_lh = all_text_gaps[len(all_text_gaps) // 2]
+
+    return row_heights, text_lh, row_line_heights
+
+
 def _measure_block_line_height(
-    fitz_doc, page_idx: int, bbox: list[float],
+    bbox: list[float], n_lines: int = 1,
 ) -> float | None:
     """
-    测量 block 区域内文字行的实际行高（y0 差值中位数），单位 pt。
+    测量 block 的实际行高，用于 DOCX 的 EXACTLY line_spacing。
 
-    通用函数，适用于所有 block 类型（text/title/index/table/list）。
-    从 PDF 直接提取每个 block 的真实行高，而非用统一默认值。
-    这样不同段落、不同表格各自还原为原 PDF 的真实行距。
+    方法：用 block bbox 的实际高度除以 MinerU 识别的行数。
+    这样 line_spacing × 行数 = block 的实际垂直占用，
+    精确还原 PDF 中该 block 所占的高度。
 
-    方法：在 block bbox 内收集所有文字行的 y0，按列分组后
-    计算同列连续行的 y0 差值，取中位数作为行高。
+    原理验证：
+      多行 block: bbox高63pt / 3行 = 21pt → DOCX: 21pt×3 = 63pt = 原始高度 ✓
+      单行 block: bbox高14pt / 1行 = 14pt → DOCX: 14pt = 字符高度 ✓
+      配合 space_after = gap_after，总占用 = bbox高 + gap = 原PDF段间距 ✓
 
-    返回 None 表示提取失败（调用方回退到默认行距）。
+    返回 None 表示 bbox 无效（调用方回退到默认行距）。
     """
-    page = fitz_doc[page_idx]
-    d = page.get_text("dict")
-    x0_min, y0_min, x1_max, y1_max = bbox
-
-    # 先收集 block 内所有 span 的字号，取众数作为主导字号
-    # 用于动态计算行高过滤范围（而非写死 12-45pt）
-    size_counter: dict[float, int] = {}
-    for block in d.get("blocks", []):
-        if block.get("type") != 0:
-            continue
-        for line in block.get("lines", []):
-            lx0 = line["bbox"][0]
-            ly0 = line["bbox"][1]
-            if not (x0_min - 5 <= lx0 <= x1_max + 5 and
-                    y0_min - 5 <= ly0 <= y1_max + 5):
-                continue
-            for sp in line.get("spans", []):
-                if sp["text"].strip():
-                    sz = round(sp["size"], 1)
-                    size_counter[sz] = size_counter.get(sz, 0) + 1
-    dominant_size = max(size_counter, key=size_counter.get) if size_counter else 12.0
-    # 行高合理范围：字号 × [0.8, 3.5]（覆盖单倍到多倍行距）
-    gap_min = dominant_size * 0.8
-    gap_max = dominant_size * 3.5
-
-    # 收集 block bbox 内所有文字行
-    # 按 x0 粗分列（同一列的文字 x0 接近），便于只算同列内连续行距
-    col_y0s: dict[int, list[float]] = {}  # 列桶 → y0 列表
-    for block in d.get("blocks", []):
-        if block.get("type") != 0:
-            continue
-        for line in block.get("lines", []):
-            spans = [sp for sp in line.get("spans", []) if sp["text"].strip()]
-            if not spans:
-                continue
-            ly0 = line["bbox"][1]
-            lx0 = line["bbox"][0]
-            # 限定在 block bbox 内
-            if not (x0_min - 5 <= lx0 <= x1_max + 5 and
-                    y0_min - 5 <= ly0 <= y1_max + 5):
-                continue
-            text = "".join(sp["text"] for sp in spans)
-            if len(text) < 3:
-                continue  # 跳过短文本（条款号等），避免干扰行高
-            # 列桶：x0 每 20pt 一个桶（同一列文字 x0 差异通常 < 20pt）
-            col_bucket = int(lx0 // 20)
-            col_y0s.setdefault(col_bucket, []).append(ly0)
-
-    # 收集所有列内的连续 y0 差值
-    all_gaps: list[float] = []
-    for y0_list in col_y0s.values():
-        y0_list.sort()
-        for i in range(1, len(y0_list)):
-            gap = y0_list[i] - y0_list[i - 1]
-            if gap_min <= gap <= gap_max:
-                all_gaps.append(gap)
-
-    if len(all_gaps) < 2:
+    if not bbox or len(bbox) < 4 or n_lines < 1:
         return None
-
-    all_gaps.sort()
-    return all_gaps[len(all_gaps) // 2]  # 中位数
+    block_h = bbox[3] - bbox[1]
+    if block_h <= 0:
+        return None
+    return round(block_h / n_lines, 1)
 
 
 def _match_blocks_with_toc(fitz_doc, pdf_info: list) -> int:
@@ -816,6 +929,39 @@ def _set_table_fixed_width(table, col_widths_pt: list[float]) -> None:
                 cell.width = Pt(col_widths_pt[ci])
 
 
+def _set_table_row_heights(
+    table, row_heights_pt: list[float], rule: str = "exact",
+) -> None:
+    """
+    设置表格每行高度，直接操作 OOXML 的 trHeight。
+
+    row_heights_pt 是从 PDF row bbox 提取的每行高度(pt)。
+    rule: 'exact' 或 'atLeast'
+      - exact：行高固定为 PDF 值，内容溢出会被裁剪（HTML 路径用）
+      - atLeast：行高至少为 PDF 值，内容更多时自动增高（PyMuPDF 重建路径用，
+        因为 DOCX 渲染换行点可能与 PDF 不同，exact 会裁剪末尾文字）
+    """
+    from docx.oxml.ns import qn
+    from docx.oxml import OxmlElement
+
+    for ri, tr in enumerate(table.rows):
+        if ri >= len(row_heights_pt):
+            break
+        h_pt = row_heights_pt[ri]
+        if h_pt <= 0:
+            continue
+        trPr = tr._tr.get_or_add_trPr()
+        # 移除旧的 trHeight
+        for old in trPr.findall(qn('w:trHeight')):
+            trPr.remove(old)
+        trHeight = OxmlElement('w:trHeight')
+        # pt → twips(dxa)：1pt = 20 twips
+        trHeight.set(qn('w:val'), str(round(h_pt * 20)))
+        trHeight.set(qn('w:hRule'), rule)
+        trPr.append(trHeight)
+
+
+
 def _normalize_text(s: str) -> str:
     """去除空白用于文本匹配（空格/换行差异不影响内容比对）。"""
     return re.sub(r"\s+", "", s or "")
@@ -900,18 +1046,102 @@ def _enrich_rows_with_pymupdf_text(
                 cell_data["text"] = best_match
 
 
+def _build_table_from_pymupdf(
+    doc, block: dict[str, Any], pymupdf_cells: list[list[str]],
+) -> None:
+    """
+    从 PyMuPDF 表格数据直接构建 DOCX 表格。
+
+    用于两种场景：
+    1. MinerU 未提供 HTML（如某些页的跨页续表）
+    2. 跨页表格：MinerU HTML 的行结构有 AI 推理错误（续行拆分+OCR错位），
+       PyMuPDF 原始行结构更准确，直接用它重建。
+
+    pymupdf_cells: PyMuPDF extract() 返回的 cell 文本矩阵 [row][col]
+    """
+    n_rows = len(pymupdf_cells)
+    n_cols = max((len(row) for row in pymupdf_cells), default=1)
+    if n_rows == 0:
+        return
+
+    table = doc.add_table(rows=n_rows, cols=n_cols)
+    try:
+        table.style = "Table Grid"
+    except KeyError:
+        pass
+
+    # 列宽
+    col_widths = block.get("_col_widths")
+    if col_widths and len(col_widths) == n_cols:
+        _set_table_fixed_width(table, col_widths)
+
+    # cell 样式和行高（从 block 中预扫描提取的 PyMuPDF 数据）
+    cell_styles = block.get("_table_cell_styles")
+    table_lh = block.get("_table_line_height") or block.get("_doc_line_height")
+    row_line_heights = block.get("_table_row_line_heights")
+
+    # 转换为 rows 格式：[[{"text": ..., "rowspan": 1, "colspan": 1}, ...], ...]
+    rows_data = []
+    for ri in range(n_rows):
+        row = []
+        for ci in range(min(n_cols, len(pymupdf_cells[ri]) if ri < len(pymupdf_cells) else 0)):
+            row.append({"text": pymupdf_cells[ri][ci] or "", "rowspan": 1, "colspan": 1})
+        rows_data.append(row)
+
+    # 先设行高，再填 cell
+    row_heights = block.get("_table_row_heights")
+    if row_heights and len(row_heights) == n_rows:
+        _set_table_row_heights(table, row_heights)
+
+    _fill_table_cells(table, rows_data, block.get("_style"), table_lh,
+                      row_line_heights, cell_styles)
+
+
 def _build_table(doc, block: dict[str, Any]) -> None:
     """
-    表格：解析 HTML（含 rowspan/colspan）→ python-docx 表格。
-    MinerU 3.x 的 table HTML 在 blocks[].lines[].spans[].html 里。
+    表格：优先解析 MinerU HTML，无 HTML 时从 PyMuPDF 数据重建。
     """
+    # 跳过已被跨页合并处理的续页 block
+    if block.get("_table_merged"):
+        return
+
     table_html = _extract_table_html(block)
+    pymupdf_cells = block.get("_pymupdf_cells")
+
     if not table_html:
+        # MinerU 未提供 HTML（如某些页的跨页续表），从 PyMuPDF 数据重建
+        if pymupdf_cells:
+            _build_table_from_pymupdf(doc, block, pymupdf_cells)
         return
 
     rows = _parse_html_table(table_html)
     if not rows:
         return
+
+    # ── 跨页表格：直接用 PyMuPDF 原始行结构重建 ──
+    # MinerU HTML 是 AI 推理结果，跨页大单元格常被错误拆成多余 <tr>
+    # （如 1.15 条目跨页，MinerU 拆成3行+文本错位+OCR重复）。
+    # PyMuPDF extract() 是 PDF 结构直接提取，文字100%准确。
+    #
+    # 跨页大单元格在 PDF 中物理上就是分段的（如 1.15 在第8页底部67pt +
+    # 第9页顶部432pt），PyMuPDF 正确地把它们识别为两行（续行 col0 为空）。
+    # 直接用这个原始结构重建表格，每行用 PDF 真实行高（exact 模式），
+    # Word 会自然分页——主行在上一页底部、续行在下一页顶部，完美复刻 PDF。
+    # 不合并续行（合并后行高过大无法跨页，且破坏 PDF 原始结构）。
+    n_cols_pm = len(pymupdf_cells[0]) if pymupdf_cells else 0
+    if pymupdf_cells and block.get("_table_crosspage") and n_cols_pm == 2:
+        print(f"  ℹ️ 跨页表格用PyMuPDF原始结构重建: {len(pymupdf_cells)}行"
+              f"(含跨页续行)", file=sys.stderr)
+        _build_table_from_pymupdf(doc, block, pymupdf_cells)
+        return
+
+    # ── 合并续行（MinerU 将单元格溢出行错误拆分为独立 tr）──
+    # 跨页表格中，大单元格的文字溢出时 MinerU 会生成多余的 <tr>
+    # 这些"续行"特征：col0 不像条款号（不是 "1.1" 格式）。
+    # 但是合并后的行高无法精确匹配 PDF 原始行高（trHeight 不匹配），
+    # 且合并会增加每行文本量导致 Word 自然换行更多。
+    # 暂时关闭，待 trHeight 跨页映射方案完善后再启用。
+    # rows = _merge_continuation_rows(rows)
 
     # 计算实际列数（考虑 colspan）
     max_cols = max(sum(c.get("colspan", 1) for c in row) for row in rows)
@@ -945,8 +1175,17 @@ def _build_table(doc, block: dict[str, Any]) -> None:
     # 用 PyMuPDF 数据作为基准：如果 PyMuPDF 显示 col0 为空但 HTML 有文本 → 错位
     _fix_crosspage_cell_misplacement(rows, pymupdf_cells)
 
-    _fill_table_cells(table, rows, block.get("_style"),
-                      block.get("_line_height") or block.get("_doc_line_height"))
+    # cell 段落行距：优先用表格内文字行高，回退到文档行高
+    table_lh = block.get("_table_line_height") or block.get("_doc_line_height")
+    row_line_heights = block.get("_table_row_line_heights")
+
+    # 先设行高（在 _fill_table_cells 之前），使 cell 行距可约束于 trHeight
+    row_heights = block.get("_table_row_heights")
+    if row_heights and len(row_heights) == len(table.rows):
+        _set_table_row_heights(table, row_heights)
+
+    _fill_table_cells(table, rows, block.get("_style"), table_lh, row_line_heights,
+                      block.get("_table_cell_styles"))
 
 
 def _parse_html_table(table_html: str) -> list[list[dict[str, Any]]]:
@@ -987,6 +1226,66 @@ def _parse_html_table(table_html: str) -> list[list[dict[str, Any]]]:
             rows.append(row)
 
     return rows
+
+
+def _merge_continuation_rows(
+    rows: list[list[dict[str, Any]]],
+) -> list[list[dict[str, Any]]]:
+    """
+    合并 MinerU 跨页表格中的"续行"。
+
+    MinerU 在处理大单元格（内容跨多行）时，有时会把同一行的文字溢出生
+    成额外的 <tr> 元素。这些"续行"特征：
+      - col0（条款号列）为空
+      - col1 文本不以条款号/标题开头（不是新行的开始）
+
+    将它们合并回上一行，避免表格行数膨胀（如原 PDF 22 行 → MinerU 33 行）。
+    """
+    import re
+
+    # 判断文本是否像一个条款号（如 "1.1"、"5"、"1.18 1.19"）
+    def _is_clause_number(text: str) -> bool:
+        if not text.strip():
+            return False
+        # 单个条款号: 数字(可选.数字) + 可选空格
+        # 多个条款号空格分隔: 上条重复
+        return bool(re.match(r'^\d+(\.\d+)*(\s+\d+(\.\d+)*)*\s*$', text.strip()))
+
+    # 判断是否为表头行（如"条款号"、"内容"）
+    def _is_header_like(text: str) -> bool:
+        t = text.strip()
+        return t in ('条款号', '内容', '名称', '说明', '备注')
+
+    merged: list[list[dict[str, Any]]] = []
+    for ri, row in enumerate(rows):
+        if not row:
+            merged.append(row)
+            continue
+
+        is_continuation = False
+        if merged and len(row) >= 2:
+            col0_text = (row[0].get("text", "") or "").strip()
+            # 续行：col0 不像条款号（非 "1.1"、"5"、"1.18 1.19" 格式）
+            # 且排除表头行（如"条款号"）——它们虽然不像条款号，但是合法的第一列文本
+            if not _is_clause_number(col0_text) and not _is_header_like(col0_text):
+                is_continuation = True
+
+        if is_continuation:
+            prev_row = merged[-1]
+            for ci, cell in enumerate(row):
+                if ci < len(prev_row):
+                    cur_text = cell.get("text", "") or ""
+                    if cur_text.strip():
+                        # col0 是条款号列，续行的 col0 通常是溢出文本（如"商自行承担"），
+                        # 不应合并到上一行的条款号中。只合并内容列（ci >= 1）的文本。
+                        if ci == 0:
+                            continue
+                        prev_text = prev_row[ci].get("text", "") or ""
+                        prev_row[ci]["text"] = prev_text + cur_text
+        else:
+            merged.append([dict(c) for c in row])
+
+    return merged
 
 
 def _fix_crosspage_cell_misplacement(
@@ -1043,16 +1342,61 @@ def _fix_crosspage_cell_misplacement(
 
 def _fill_table_cells(table, rows: list[list[dict[str, Any]]],
                       style: dict[str, Any] | None = None,
-                      line_height: float | None = None) -> None:
+                      line_height: float | None = None,
+                      row_line_heights: list[float | None] | None = None,
+                      cell_styles: list[list[list[dict[str, Any]]]] | None = None,
+                      natural_wrap: bool = False) -> None:
     """
     填充表格单元格，处理 rowspan/colspan 合并，并应用样式。
-    style 是 block._style（align.py 贴的兜底样式），应用到每个单元格的文字。
-    line_height 是从 PDF 测量的表格内文字行高（pt），无则回退默认。
+
+    style: block._style（兜底样式，当 cell_styles 不可用时使用）
+    line_height: 表格级兜底行高（pt）
+    row_line_heights: 每行的文字行间距（pt），优先级最高
+    cell_styles: 从 PDF dict 提取的每 cell 内 span 样式，优先级最高。
+      格式: cell_styles[r][c] = [{"text","font","size","bold","italic","color"}, ...]
+    natural_wrap: True 时不按 PDF 视觉行硬换行（add_break），让 Word 根据
+      实际列宽自然换行。用于 PyMuPDF 重建路径——DOCX 字体度量与 PDF 内嵌
+      字体不完全一致，硬换行会导致一行放不下时多换行+末尾字被裁剪。
     """
     occupied: dict[tuple[int, int], bool] = {}
+    from docx.shared import Pt as _Pt
+    from docx.enum.text import WD_LINE_SPACING
+    from docx.oxml.ns import qn as _qn
+
+    # 获取每行的 trHeight（用于约束 line_spacing，防止内容溢出）
+    # 注意：必须与 table.rows 一一对应（含 None），不能跳过无 trHeight 的行，
+    # 否则索引错位会导致 safe_lh 计算错误（如合并行读到下一行的 trHeight）。
+    row_tr_heights: list[float | None] = []
+    for tr in table.rows:
+        tr_h = None
+        trPr = tr._tr.find(_qn('w:trPr'))
+        if trPr is not None:
+            th = trPr.find(_qn('w:trHeight'))
+            if th is not None:
+                tr_h = int(th.get(_qn('w:val'))) / 20
+        row_tr_heights.append(tr_h)
 
     for r_idx, row in enumerate(rows):
         c_idx = 0
+        r_lh = line_height or 22
+        if row_line_heights and r_idx < len(row_line_heights) and row_line_heights[r_idx]:
+            r_lh = row_line_heights[r_idx]
+
+        # 安全约束：根据本行 trHeight 和 cell 文字行数，确保内容不溢出
+        # line_spacing 不能超过 trHeight / (max_cell_lines + 0.3)
+        # +0.3 给 cell 上下内边距留余量，与 _extract_table_row_geometry 的计算一致
+        tr_h = row_tr_heights[r_idx] if r_idx < len(row_tr_heights) else None
+        if tr_h and tr_h > 0:
+            # 扫描本行所有 cell 的文字行数，取最大值
+            max_lines = 0
+            for cd in row:
+                t_lines = (cd.get("text") or "").count("\n") + 1
+                max_lines = max(max_lines, t_lines)
+            if max_lines > 0:
+                safe_lh = tr_h / (max_lines + 0.5)
+                if r_lh > safe_lh:
+                    r_lh = safe_lh
+
         for cell_data in row:
             while occupied.get((r_idx, c_idx)):
                 c_idx += 1
@@ -1065,32 +1409,73 @@ def _fill_table_cells(table, rows: list[list[dict[str, Any]]],
 
             try:
                 target_cell = table.cell(r_idx, c_idx)
-                # 用 run 设文字（而不是 cell.text），这样可以应用样式
                 target_cell.text = ""  # 清空
+                # 设置 cell 四边内边距为 0：
+                # 上下清零消除 exact 模式下内容被裁剪；
+                # 左右清零使可用文字宽度 = cell 全宽（与 PDF 一致），
+                # 避免默认 5.4pt×2 内边距吃掉宽度导致末尾字被裁剪。
+                from docx.oxml import OxmlElement as _OxmlEl
+                tcPr = target_cell._tc.get_or_add_tcPr()
+                tcMar = _OxmlEl('w:tcMar')
+                for side in ('top', 'bottom', 'left', 'right'):
+                    m = _OxmlEl(f'w:{side}')
+                    m.set(_qn('w:w'), '0')
+                    m.set(_qn('w:type'), 'dxa')
+                    tcMar.append(m)
+                tcPr.append(tcMar)
                 para = target_cell.paragraphs[0]
-                # 设置段落行距：从 PDF 测量的真实行高，无数据时回退 22pt
-                # python-docx 默认继承 Word 的 1.15 倍多倍行距（约17pt），
-                # 比源 PDF 表格紧凑，需用固定行距匹配原文。
-                from docx.shared import Pt as _Pt
-                from docx.enum.text import WD_LINE_SPACING
                 pf = para.paragraph_format
                 pf.line_spacing_rule = WD_LINE_SPACING.EXACTLY
-                pf.line_spacing = _Pt(line_height or 22)  # 22 = 全文档无行高数据时的最后兜底
+                pf.line_spacing = _Pt(r_lh)
                 pf.space_before = _Pt(0)
                 pf.space_after = _Pt(0)
-                # 支持单元格内换行：文本含 \n 时，用 run.add_break() 渲染
-                if "\n" in text:
-                    lines = text.split("\n")
-                    run = para.add_run()
-                    for li, line in enumerate(lines):
-                        if li > 0:
-                            run.add_break()  # <w:br/> 单元格内换行
-                        if line:
-                            run.add_text(line)
+
+                # 优先用 PDF per-cell span 序列按实际字体/字号逐个渲染
+                spans_data = None
+                if (cell_styles and r_idx < len(cell_styles) and
+                        c_idx < len(cell_styles[r_idx])):
+                    spans_data = cell_styles[r_idx][c_idx]
+
+                if spans_data:
+                    # 按 span 的实际样式逐个创建 run，还原 PDF 原始字体/字号
+                    # 换行检测：相邻 span y 差 >= 5pt 视为新视觉行
+                    # （与 _extract_table_cell_styles 的分组逻辑一致）
+                    prev_y = None
+                    for sp in spans_data:
+                        sp_text = sp.get("text") or ""
+                        if not sp_text.strip():
+                            continue
+                        sp_y = sp.get("_y")
+                        if prev_y is not None and sp_y is not None:
+                            if abs(sp_y - prev_y) >= 5 and not natural_wrap:
+                                # 新视觉行：添加换行符（natural_wrap 模式下跳过，
+                                # 让 Word 根据实际列宽自然换行）
+                                br_run = para.add_run()
+                                br_run.add_break()
+                        prev_y = sp_y
+                        sp_style = {
+                            "font": sp.get("font"),
+                            "size": sp.get("size"),
+                            "bold": sp.get("bold"),
+                            "italic": sp.get("italic"),
+                            "color": sp.get("color"),
+                        }
+                        run = para.add_run(sp_text)
+                        _apply_style(run, sp_style)
                 else:
-                    run = para.add_run(text)
-                if style:
-                    _apply_style(run, style)
+                    # 无 per-cell 样式数据，回退到 block 级样式
+                    if "\n" in text:
+                        lines = text.split("\n")
+                        run = para.add_run()
+                        for li, line in enumerate(lines):
+                            if li > 0:
+                                run.add_break()
+                            if line:
+                                run.add_text(line)
+                    else:
+                        run = para.add_run(text)
+                    if style:
+                        _apply_style(run, style)
 
                 # 处理 colspan（水平合并）
                 if colspan > 1:
@@ -1239,6 +1624,10 @@ def _detect_page_margins(pdf_path: str, pdf_info: list) -> dict[str, float] | No
     用 PyMuPDF 精确提取 PDF 页面边距。
     取多页（跳过首页封面）所有 span 的坐标范围，算出上下左右边距。
     比 MinerU block bbox 精确（MinerU bbox 底部系统性偏低）。
+
+    页脚/页眉排除：页脚（如"—1—"）位于页面最底部，如果不排除，
+    max(y1s) 会取到页脚坐标，导致下边距被严重低估（如 47pt vs 真实 84pt）。
+    用 y 阈值（页高 ±60pt 范围内的行视为页眉/页脚）排除。
     """
     try:
         import fitz
@@ -1267,6 +1656,10 @@ def _detect_page_margins(pdf_path: str, pdf_info: list) -> dict[str, float] | No
             if block.get("type") != 0:
                 continue
             for line in block.get("lines", []):
+                ly0 = line["bbox"][1]
+                # 排除页脚（页面底部 60pt 范围内）和页眉（顶部 60pt 范围）
+                if ly0 > ph - 60 or ly0 < 60:
+                    continue
                 for sp in line.get("spans", []):
                     if not sp["text"].strip():
                         continue
@@ -1392,14 +1785,20 @@ def build_docx(
                     if not (bbox and len(bbox) >= 4):
                         continue
 
-                    # 所有类型：提取真实行高
-                    line_h = _measure_block_line_height(fdoc, pi, bbox)
-                    if line_h:
-                        block["_line_height"] = line_h
-                        line_h_found += 1
+                    # 所有类型：提取真实行高（bbox高度 / MinerU行数）
+                    # table 类型跳过——table block 的 bbox 是整个表格的高度，
+                    # MinerU 行数(lines)为 0，bbox高/1 = 表格总高（如 600pt），
+                    # 传给单元格行距会导致每行占满一页。
+                    if btype != "table":
+                        n_lines = len(block.get("lines", [])) or 1
+                        line_h = _measure_block_line_height(bbox, n_lines)
+                        if line_h:
+                            block["_line_height"] = line_h
+                            line_h_found += 1
 
-                    # table 类型：额外提取列宽和单元格文本
+                    # table 类型：额外提取列宽、单元格文本、行高
                     if btype == "table":
+                        fitz_page = fdoc[pi]
                         mtable = _find_matching_pymupdf_table(fdoc, pi, bbox)
                         if mtable is None:
                             continue
@@ -1411,6 +1810,162 @@ def build_docx(
                         if cell_texts:
                             block["_pymupdf_cells"] = cell_texts
                             texts_found += 1
+                        cell_styles = _extract_table_cell_styles(mtable, fitz_page)
+                        if cell_styles:
+                            block["_table_cell_styles"] = cell_styles
+                        # 行高和 cell 内文字行高（从 PDF 原始数据提取）
+                        row_heights, text_lh, row_lhs = _extract_table_row_geometry(mtable, fitz_page)
+                        if row_heights:
+                            block["_table_row_heights"] = row_heights
+                            block["_table_row_line_heights"] = row_lhs
+                        if text_lh:
+                            block["_table_line_height"] = text_lh
+
+            # ── 跨页表格数据合并 ──
+            # MinerU 把跨页表格的全部行放在第一个 table block 的 HTML 中，
+            # 但 PyMuPDF 表格数据（每行高度、cell 文本含换行）分散在各页。
+            # 收集后续续页的 PyMuPDF 数据，合并到第一个 block。
+            for pi, page in enumerate(pdf_info):
+                page_idx = page.get("page_idx", 0)
+                if page_idx >= fdoc.page_count:
+                    continue
+                page_blocks = page.get("para_blocks") or page.get("blocks") or []
+                for bi, block in enumerate(page_blocks):
+                    btype = (block.get("type") or "").lower()
+                    if btype != "table":
+                        continue
+                    html = _extract_table_html(block)
+                    if not html:
+                        continue  # 续页 block 无 HTML，跳过（数据将在下面被前驱合并）
+                    # 此 block 有 HTML → 它是跨页表格的主 block
+                    # 向后查找续页的 table block，合并 PyMuPDF 数据
+                    merged_cells = list(block.get("_pymupdf_cells") or [])
+                    merged_heights = list(block.get("_table_row_heights") or [])
+                    merged_row_lhs = list(block.get("_table_row_line_heights") or [])
+                    merged_cell_styles = list(block.get("_table_cell_styles") or [])
+                    # 向后扫描 page_idx+1 直到遇到有 HTML 的 table 或页面结束
+                    for look_pi in range(pi + 1, len(pdf_info)):
+                        look_page = pdf_info[look_pi]
+                        look_idx = look_page.get("page_idx", 0)
+                        if look_idx >= fdoc.page_count:
+                            continue
+                        found_continuation = False
+                        for look_block in (look_page.get("para_blocks") or look_page.get("blocks") or []):
+                            if (look_block.get("type") or "").lower() != "table":
+                                continue
+                            look_html = _extract_table_html(look_block)
+                            if look_html:
+                                # 遇到另一个有 HTML 的 table → 不是续页
+                                break
+                            # 续页 block：合并其 PyMuPDF 数据
+                            look_bbox = look_block.get("bbox")
+                            if not (look_bbox and len(look_bbox) >= 4):
+                                continue
+                            mtable = _find_matching_pymupdf_table(fdoc, look_idx, look_bbox)
+                            if mtable is None:
+                                continue
+                            ct = _extract_table_cell_texts(mtable)
+                            if ct:
+                                merged_cells.extend(ct)
+                            fitz_page = fdoc[look_idx]
+                            cs = _extract_table_cell_styles(mtable, fitz_page)
+                            if cs:
+                                merged_cell_styles.extend(cs)
+                            rh, _, row_lhs = _extract_table_row_geometry(mtable, fitz_page)
+                            if rh:
+                                merged_heights.extend(rh)
+                                merged_row_lhs.extend(row_lhs)
+                            # 续页的 _table_line_height（取第一个有效的）
+                            if not block.get("_table_line_height"):
+                                _, tlh, _ = _extract_table_row_geometry(mtable, fitz_page)
+                                if tlh:
+                                    block["_table_line_height"] = tlh
+                            # 标记续页 block 已合并，_build_table 将跳过
+                            look_block["_table_merged"] = True
+                            found_continuation = True
+                        if not found_continuation:
+                            break  # 没找到续页 table → 停止扫描
+                    if merged_cells:
+                        block["_pymupdf_cells"] = merged_cells
+                        # 标记为跨页表格主 block，续行合并只对此类 block 生效
+                        block["_table_crosspage"] = True
+                    if merged_heights:
+                        block["_table_row_heights"] = merged_heights
+                        block["_table_row_line_heights"] = merged_row_lhs
+                    if merged_cell_styles:
+                        block["_table_cell_styles"] = merged_cell_styles
+
+            # ── 补救 MinerU 漏检的表格 ──
+            # MinerU 有时把整个表格误判为多个 text block（如第13页），
+            # 导致 DOCX 中丢失表格结构。用 PyMuPDF find_tables 交叉校验：
+            # 如果 PyMuPDF 在某页检测到表格但 MinerU 没有 table block，
+            # 将该页 text block 替换为一个 table block（含 PyMuPDF 数据）。
+            for page in pdf_info:
+                pi = page.get("page_idx", 0)
+                if pi >= fdoc.page_count:
+                    continue
+                fitz_page = fdoc[pi]
+                # MinerU 是否已有 table block
+                has_table = any(
+                    (b.get("type") or "").lower() == "table"
+                    for b in (page.get("para_blocks") or page.get("blocks") or [])
+                )
+                if has_table:
+                    continue  # 已有表格，不需要补救
+
+                # PyMuPDF 是否检测到表格
+                pm_tabs = fitz_page.find_tables()
+                for pm_t in pm_tabs.tables:
+                    # 验证是真表格（有边框/足够行数），避免误判
+                    if pm_t.row_count < 1 or pm_t.col_count < 2:
+                        continue
+                    cell_texts = _extract_table_cell_texts(pm_t)
+                    if not cell_texts or not any(
+                        any(c and c.strip() for c in row) for row in cell_texts
+                    ):
+                        continue  # 所有 cell 为空，不是真表格
+                    widths = _extract_table_col_widths_from_table(pm_t)
+                    row_heights, text_lh, row_lhs = _extract_table_row_geometry(pm_t, fitz_page)
+                    cell_styles = _extract_table_cell_styles(pm_t, fitz_page)
+
+                    # 创建一个新的 table block
+                    new_block: dict[str, Any] = {
+                        "type": "table",
+                        "bbox": list(pm_t.bbox),
+                        "blocks": [],
+                        "lines": [],
+                        "_style": {"font": "FangSong", "size": 12.0, "bold": False, "italic": False, "color": 0},
+                    }
+                    if cell_texts:
+                        new_block["_pymupdf_cells"] = cell_texts
+                    if widths:
+                        new_block["_col_widths"] = widths
+                    if row_heights:
+                        new_block["_table_row_heights"] = row_heights
+                        new_block["_table_row_line_heights"] = row_lhs
+                    if text_lh:
+                        new_block["_table_line_height"] = text_lh
+                    if cell_styles:
+                        new_block["_table_cell_styles"] = cell_styles
+
+                    # 替换该页 blocks：移除落在表格 bbox 内的 text block
+                    tx0, ty0, tx1, ty1 = pm_t.bbox
+                    old_blocks = page.get("para_blocks") or page.get("blocks") or []
+                    kept = []
+                    removed = 0
+                    for b in old_blocks:
+                        bbox = b.get("bbox", [])
+                        if bbox and len(bbox) >= 4:
+                            # block 完全在表格 bbox 内 → 移除
+                            if (tx0 - 5 <= bbox[0] and bbox[2] <= tx1 + 5 and
+                                    ty0 - 5 <= bbox[1] and bbox[3] <= ty1 + 5):
+                                removed += 1
+                                continue
+                        kept.append(b)
+                    page["para_blocks"] = kept + [new_block]
+                    page["blocks"] = kept + [new_block]
+                    print(f"  📋 第{pi+1}页补救表格: MinerU 漏检，从 PyMuPDF 重建"
+                          f"（移除{removed}个 text block）", file=sys.stderr)
 
             # ── 用 PDF 大纲（书签）确定标题层级 ──
             # PDF 大纲是作者在 Word 里设置的大纲层级，是文档结构的权威定义。
@@ -1430,7 +1985,9 @@ def build_docx(
     # 替代所有硬编码值（82pt 左边距、595pt 页宽），支持不同版式的 PDF
     _detect_page_layout(pdf_info, margins)
 
-    # ── 文档级行高中位数（兜底值，替代硬编码的 24pt）──
+    # ── 行高兜底值（仅用于 bbox 无效的极端情况）──
+    # 正常情况下每个 block 都能从 bbox高度/行数 直接取到精确行高，
+    # 此兜底值仅在 bbox 数据缺失时使用。
     all_lh = []
     for page in pdf_info:
         for b in (page.get("para_blocks") or page.get("blocks") or []):
@@ -1441,8 +1998,10 @@ def build_docx(
     if all_lh:
         all_lh.sort()
         doc_median_lh = all_lh[len(all_lh) // 2]
+
     for page in pdf_info:
-        for b in (page.get("para_blocks") or page.get("blocks") or []):
+        page_blocks = page.get("para_blocks") or page.get("blocks") or []
+        for b in page_blocks:
             b["_doc_line_height"] = doc_median_lh
 
     # ── 段后间距：从同页相邻 block 的 Y 坐标差计算 ──

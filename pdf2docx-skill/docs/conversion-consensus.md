@@ -21,7 +21,7 @@
 **正确的做法**：
 - 页面尺寸：从 MinerU `page_size` 或 PyMuPDF `page.rect` 获取
 - 边距：用 PyMuPDF 精确提取 `_detect_page_margins`
-- 行距：从 PDF 逐 block 测量 `_measure_block_line_height`，兜底用文档中位数
+- 行距：从 block bbox 高度 ÷ MinerU 行数 直接提取（`_measure_block_line_height`）
 - 缩进：从 span bbox 的 x0 坐标差值计算
 - 字体：保留 PDF 原始字体名，由 Word/LibreOffice 自动匹配
 - 图片：从 block bbox 提取原始尺寸
@@ -92,21 +92,38 @@
 - 联系信息（如"采购人：新疆..."）所有行统一缩进 → `left_indent=23pt, first_line_indent=0`
 - 不分层会导致多行 block 首行溢出或缩进不一致
 
-### 规则 4：行距——逐 block 从 PDF 测量，文档中位数兜底
+### 规则 4：行距——block bbox 高度 / 行数，精确还原
 
-| 层级 | 来源 | 适用场景 |
-|------|------|----------|
-| 优先 | `block["_line_height"]` | 有 PDF 测量值的 block |
-| 兜底 | `block["_doc_line_height"]` | 无测量值时用全文档中位数 |
-| 极端 | 固定值（22pt） | 全文档无任何行高数据 |
+每个 block 的 `line_spacing` = **block bbox 高度 ÷ MinerU 识别行数**。
 
-**行高测量范围**：基于 block 内主导字号动态计算（`size × 0.8` ~ `size × 3.5`），不写死 12-45pt。
+**原理**：`line_spacing × 行数 = bbox 高度`（零误差），配合 `space_after = gap_after`，
+每个 block 的垂直占用 = bbox 高 + gap = 原 PDF 中该 block 的精确垂直空间。
 
-### 规则 5：页面边距——用 PyMuPDF 精确提取，不裁剪不覆盖
+| block 类型 | line_spacing 计算 | 示例 |
+|------------|-------------------|------|
+| 单行 | bbox 高度 / 1 | bbox=14pt → lh=14pt（字符高度） |
+| 多行 | bbox 高度 / 行数 | bbox=63pt, 3行 → lh=21pt → DOCX: 21×3=63pt ✓ |
 
-- 用 `_detect_page_margins` 从 PDF 提取上下左右边距（采样多页取中位数）
+**禁止的做法**：
+- 用 y0 差值（baseline 间距）作为行高——它 ≠ DOCX 的 EXACTLY 行高语义，导致多行段落总高度偏大
+- 用文档/同页中位数作为回退——不同段落行距各异，中位数是"猜"而非"取"
+- 单行 block 无法测行高 → 回退中位数（应直接用 bbox 高度）
+
+**兜底**：仅在 bbox 数据无效时用文档中位数（极端情况，正常 PDF 覆盖率 100%）。
+
+### 规则 5：页面边距——用 PyMuPDF 精确提取，排除页眉页脚
+
+- 用 `_detect_page_margins` 从 PDF 提取上下左右边距
+- **必须排除页眉/页脚**：`ly0 > 页高 - 60`（页脚）或 `ly0 < 60`（页眉）的行不参与统计
 - 直接用提取值，**不加 `max(X, 28)` 裁剪**
-- 边距设好后**不被后续代码覆盖**（之前的"内容边距修正"代码会覆盖精确值为不准确的统计值）
+- 边距设好后**不被后续代码覆盖**
+
+**为什么必须排除页脚**（曾导致的问题）：
+- 页脚"—1—"固定在 y1=794.7pt，如果不排除，`max(y1s)` 取到页脚坐标
+- 下边距被低估为 47pt（页脚到页底），而真实正文下边距约 84pt
+- 内容区被错误放大 37pt ≈ 每页多放 2 行，随页数累积越来越严重
+
+**下边距取值策略**：`min(bottom_margins)`——内容最满的页反映真实下边距。
 
 ### 规则 6：标题分类——结构标题 vs 视觉标题
 
@@ -123,7 +140,55 @@
 - 从 `table.cells` 的 x 坐标边界计算列宽
 - 通过 OOXML `tblGrid` + `tblLayout type=fixed` 设置（不是 `cell.width`，LibreOffice 忽略后者）
 
-### 规则 8：跨页表格错位修复——两层策略
+### 规则 8：表格行高与 cell 行距——同源、先设行高再填 cell
+
+trHeight（OOXML `trHeight`）和 cell 段落 `line_spacing` 必须满足：
+`line_spacing × cell文字行数 ≤ trHeight`，否则 exact 模式下内容被裁剪。
+
+**实现要点**：
+- **先设 trHeight，再调 `_fill_table_cells`**——cell 填充时需读取 trHeight 做安全约束
+- trHeight 和 line_spacing **用同一个缩放后的 row_h**，不能各自取不同基准
+- line_spacing 安全约束：`safe_lh = min(文字间距, trHeight / cell文字行数)`
+- row_h 微缩 2% 给行间呼吸空间，但 trHeight 和 line_spacing 必须同时缩放
+
+**禁止的做法**：
+- 用 block bbox 高度 / 1 作为 table block 的 line_height（= 表格总高 600pt）
+- 用文档中位数作为表格行距（与正文行距混淆）
+- `atLeast` 模式（内容溢出时行高膨胀，导致表格跨页数翻倍）——用 `exact`
+
+### 规则 9：跨页表格数据合并——首页主 block 收集全部 PyMuPDF 数据
+
+MinerU 把跨页表格的全部行放在第一个 table block 的 HTML 中，
+但 PyMuPDF 表格数据（每行高度、cell 文本含换行、cell 样式）分散在各页。
+
+**必须合并**：主 block（有 HTML）向后扫描续页 block（无 HTML），
+收集各页的 `_pymupdf_cells` / `_table_row_heights` / `_table_row_line_heights` / `_table_cell_styles`。
+
+续页 block 标记 `_table_merged = True`，`_build_table` 跳过避免重复渲染。
+
+**验证**：合并后 `_table_row_heights` 行数应等于 HTML 行数（如 33 行），
+否则 trHeight 匹配失败，回退为不设行高。
+
+### 规则 10：MinerU 漏检表格——用 PyMuPDF find_tables 交叉校验
+
+MinerU 有时把整个表格误判为多个 text block（如 14 个编号段落），
+导致 DOCX 中丢失表格结构。
+
+**交叉校验**：对每页，如果 MinerU 没有 table block 但 PyMuPDF `find_tables()` 检测到表格，
+从 PyMuPDF 数据重建 table block，替换落入表格 bbox 内的 text block。
+
+### 规则 11：表格 cell 文字样式——从 PyMuPDF 提取，不用 block._style 统一
+
+每个 cell 的字体/字号/粗体应从 PDF dict 中该 cell bbox 内的 span 数据提取，
+不能用 block._style 一种样式覆盖所有 cell。
+
+**实现**：`_extract_table_cell_styles` 按 cell bbox 收集 span 样式，
+`_fill_table_cells` 用每个 cell 的主导字体（首个 span）替代 block._style。
+- col0 条款号（如 "1.1"）→ TimesNewRomanPSMT
+- col1 中文内容 → FangSong
+- cell 文本中的 `\n`（PyMuPDF extract() 保留）→ 用 `run.add_break()` 还原换行
+
+### 规则 12：跨页表格错位修复——两层策略
 
 | 策略 | 条件 | 判断方式 |
 |------|------|----------|
@@ -134,13 +199,35 @@
 - 只对 `ri < len(pymupdf_cells)` 的行用策略 1
 - 策略 2 中"含中文标点"比"正则匹配编号格式"更通用——条款号不会含句号/逗号
 
-### 规则 9：图片尺寸——从 block bbox 提取
+### 规则 13：跨页表格——直接用 PyMuPDF 原始行结构重建，不合并续行
+
+MinerU HTML 是 AI 推理结果，跨页大单元格常被错误拆成多余 `<tr>`
+（如 1.15 条目跨页，MinerU 拆成3行 + 文本错位到 col0 + OCR 文本重复）。
+PyMuPDF `extract()` 是 PDF 结构直接提取，文字 100% 准确。
+
+**核心原则：复刻 PDF，而非绘制新表格**。
+跨页大单元格在 PDF 中物理上就是分段的（如 1.15 在第8页底部67pt +
+第9页顶部432pt），PyMuPDF 正确地把它们识别为两行（续行 col0 为空）。
+直接用这个原始结构重建表格，每行用 PDF 真实行高（exact 模式），
+Word 会自然分页——主行在上一页底部、续行在下一页顶部，完美复刻 PDF。
+
+**触发条件**：block 标记为 `_table_crosspage`（跨页表格主 block）且为 2 列。
+多列表格（评分表等）不走此路径，避免误伤 rowspan 结构。
+
+**禁止的做法**：
+- **合并续行**——合并后行高累加超过单页（1.15→498pt），Word 的 exact 模式
+  不允许行内分页，整行被推到下一页（1.15另起一页）；即使不设 trHeight，
+  cell 内 23 行文本被压缩在极矮区域（safe_lh 索引错位 bug → line_spacing=1pt）
+- 对多列表格（4列+）走此路径——其 col0 空行可能是 rowspan 合并单元格
+- 盲信 MinerU HTML 行结构——AI 推理有 OCR 错误和续行拆分错误
+
+### 规则 14：图片尺寸——从 block bbox 提取
 
 - `width_in = (bbox[2] - bbox[0]) / 72`
 - 加上限保护：不超过页面内容宽度
 - 无 bbox 时回退到内容宽度
 
-### 规则 10：HTML 实体——用标准库，不全手写
+### 规则 15：HTML 实体——用标准库，不全手写
 
 - 用 `html.unescape()` 替代手写 `re.sub(r"&nbsp;", ...)` 逐个替换
 - 避免遗漏 `&lt;`、`&gt;`、`&quot;` 等实体
@@ -161,6 +248,22 @@
 | `font_baseline` 取最小字号 | 脚注密度当正文基线 | 取众数字号 |
 | 变量名 `html` 遮蔽 `html` 模块 | `html.unescape()` 报错 | 重命名为 `table_html` |
 | `_guess_heading_level` 死代码 | 文档与实现脱节 | 删除并更新文档 |
+| 行高用 y0 差值（baseline 间距） | 多行段落总高度偏大 | 用 bbox 高度/行数 |
+| 行高用文档/同页中位数兜底 | 单行 block 行距被"猜"而非"取" | 用 bbox 高度（100%覆盖） |
+| 页边距统计含页脚行 | 下边距 47pt（页脚位）而非 84pt（正文位），每页多放2行 | 排除页眉页脚后统计 |
+| 正文段落 `space_after` 写死为 0 | 段间距丢失，每页少 ~150pt | 用 `_gap_after` 设置 |
+| table block 用 bbox高/1 做行高 | 600pt 行高，每行占满一页 | table 类型跳过行高提取 |
+| cell 统一用 block._style | 条款号 "1.1" 显示为 FangSong 而非 TimesNewRomanPSMT | 按 cell 从 PDF 提取主导字体 |
+| trHeight 和 line_spacing 不同源 | line_spacing × 行数 > trHeight，exact 模式内容裁剪 | 统一用缩放后的 row_h |
+| 先填 cell 再设 trHeight | 安全约束读不到 trHeight，溢出检测失效 | 先设 trHeight 再填 cell |
+| `atLeast` 行高模式 | 内容溢出时行高膨胀，表格从3页变8页 | 用 `exact` 模式 |
+| 跨页续页 block 不标记 | 同一表格被渲染两次（94页） | 续页标记 `_table_merged` |
+| MinerU 漏检表格不补救 | 整页表格变散落文本段落 | PyMuPDF find_tables 交叉校验重建 |
+| cell 行间距含跨列 y0 | 不同列文字的 y0 差被误算为行间距（13.2pt） | 按列分组后算同列内 y0 差值 |
+| 盲信 MinerU HTML 行结构 | 跨页续行被拆成多余行 + OCR 文本错位重复（"商自行承担。应商自行承担。"） | PyMuPDF 为权威基准，直接用原始行结构重建 |
+| 合并跨页续行 | 行高累加超单页（498pt），exact 模式整行推到下一页；safe_lh 索引错位致 line_spacing=1pt | 不合并，保留 PyMuPDF 原始分页行结构 |
+| `_fill_table_cells` 的 row_tr_heights 跳过无 trHeight 行 | 索引错位，行N读到行N+1的 trHeight，safe_lh 算出 1pt 行距 | row_tr_heights 与 table.rows 一一对应（含 None） |
+| 用行数差异触发 PyMuPDF 重建 | 跨页合并后 HTML 和 PyMuPDF 行数可能恰好接近（33 vs 33） | 用 `_table_crosspage` 标记触发 |
 
 ---
 
