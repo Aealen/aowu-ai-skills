@@ -999,10 +999,10 @@ def _fix_crosspage_cell_misplacement(
     问题：跨页表格在换页处，MinerU 常把内容列的文字错放到条款号列（col0）。
     例如条款号列出现 "商自行承担。应商自行承担。可能导致投标..."（整句正文）。
 
-    修复逻辑（基于 PyMuPDF 提取的单元格数据，不分析文本内容）：
-      - 如果 PyMuPDF 数据可用：对比 col0 文本，PyMuPDF 显示 col0 为空但 HTML 有长文本
-        → 错位，把 col0 文本移到 col1 前面
-      - 如果 PyMuPDF 数据不可用：跳过（不做猜测性修正，避免破坏正常表格）
+    修复逻辑（两层）：
+      1. PyMuPDF 数据覆盖的行：对比 col0，PyMuPDF 显示为空但 HTML 有文本 → 错位
+      2. PyMuPDF 数据未覆盖的行（行数不匹配）：判断 col0 文本长度
+         —— 条款号通常 ≤10 字符，col0 超过 20 字符几乎一定是正文错位
     """
     if not pymupdf_cells:
         return  # 无 PyMuPDF 数据时不做修正
@@ -1014,13 +1014,25 @@ def _fix_crosspage_cell_misplacement(
         if not col0_text:
             continue
 
-        # 用 PyMuPDF 数据判断 col0 是否确实为空
-        pm_col0 = ""
-        if ri < len(pymupdf_cells) and len(pymupdf_cells[ri]) > 0:
-            pm_col0 = (pymupdf_cells[ri][0] or "").strip()
+        is_misplaced = False
 
-        # PyMuPDF 显示 col0 为空但 HTML 有文本 → 错位
-        if not pm_col0 and col0_text:
+        if ri < len(pymupdf_cells):
+            # 策略 1：PyMuPDF 数据覆盖到的行，对比 col0
+            pm_col0 = ""
+            if len(pymupdf_cells[ri]) > 0:
+                pm_col0 = (pymupdf_cells[ri][0] or "").strip()
+            if not pm_col0 and col0_text:
+                is_misplaced = True
+        else:
+            # 策略 2：PyMuPDF 未覆盖的行，用文本特征判断
+            # 条款号特征：短（≤10字符）、无中文标点、通常是数字+点/顿号格式
+            # 正文特征：长（>20字符）或含中文标点（句号、逗号等）
+            import re as _re
+            has_cn_punct = bool(_re.search(r'[。，；！？、：]', col0_text))
+            if len(col0_text) > 20 or has_cn_punct:
+                is_misplaced = True
+
+        if is_misplaced:
             col1_text = row[1].get("text", "").strip()
             if col1_text:
                 row[1]["text"] = col0_text + "\n" + col1_text
