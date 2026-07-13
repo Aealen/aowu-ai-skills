@@ -333,6 +333,8 @@ def main():
     p_bld.add_argument("-o", "--output", default="./output/结果.docx",
                        help="输出 docx 路径")
     p_bld.add_argument("--images-dir", default=None)
+    p_bld.add_argument("--pdf", default=None,
+                       help="源 PDF 路径（用于提取表格列宽和精确边距）")
     p_bld.set_defaults(func=cmd_build)
 
     args = parser.parse_args()
