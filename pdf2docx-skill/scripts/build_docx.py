@@ -1163,7 +1163,7 @@ def _build_list(doc, block: dict[str, Any]) -> None:
     列表：MVP 降级为普通段落（带编号文本）。
     TODO(完善): 根据 MinerU 的 list sub_type 还原编号/项目符号格式。
     """
-    line_height = block.get("_line_height")
+    line_height = block.get("_line_height") or block.get("_doc_line_height")
     for line in block.get("lines", []):
         text = "".join(
             s.get("content") or s.get("text") or ""

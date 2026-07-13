@@ -251,15 +251,13 @@ def _apply_document_density_baseline(all_spans: list[dict]) -> None:
         # 不是"加粗"。因此：
         # - 优先用同字体同字号基线（最精确：同字体同字号的粗体/常规对比）
         # - 次选用字体级基线（同字体不同字号的对比）
-        # - 最后用全局基线（仅在字体首次出现、无自身基线时使用）
+        # - 无同字体基线时跳过密度检测（交由 flags/linewidth 判断，不做跨字体猜测）
         bl = same_font_bl
         if bl is None:
             bl = font_bl
-        if bl is None:
-            bl = global_baseline
 
         if bl is None:
-            continue
+            continue  # 无同字体基线，不做密度检测（避免跨字体误判）
 
         if density > bl * 1.3 and density > 0.05:
             sp['bold'] = True
