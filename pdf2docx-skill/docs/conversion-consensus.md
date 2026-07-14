@@ -111,7 +111,7 @@
 
 **兜底**：仅在 bbox 数据无效时用文档中位数（极端情况，正常 PDF 覆盖率 100%）。
 
-### 规则 5：页面边距——用 PyMuPDF 精确提取，排除页眉页脚
+### 规则 5：页面边距——用 PyMuPDF 精确提取，排除页眉页脚，合并表格 bbox
 
 - 用 `_detect_page_margins` 从 PDF 提取上下左右边距
 - **必须排除页眉/页脚**：`ly0 > 页高 - 60`（页脚）或 `ly0 < 60`（页眉）的行不参与统计
@@ -123,7 +123,22 @@
 - 下边距被低估为 47pt（页脚到页底），而真实正文下边距约 84pt
 - 内容区被错误放大 37pt ≈ 每页多放 2 行，随页数累积越来越严重
 
-**下边距取值策略**：`min(bottom_margins)`——内容最满的页反映真实下边距。
+**四边边距都取 `min()`，且都要合并表格 bbox**：
+- `min(top_margins)` / `min(bottom_margins)` / `min(left_margins)` / `min(right_margins)`
+- 语义：内容最靠四边的页反映真实可用内容区。内容区必须能容纳**最靠边的内容**，
+  否则那一页（如表格页）会内容溢出。
+- **表格 bbox 必须纳入上下左右边距统计**——表格边框线比 cell 内文字 span 更靠外
+  （cell 有内边距）。只看文字 span 会低估表格页的真实占用范围。
+  - 左右：不合并 → 内容区比表格窄，cell 被 Word/WPS 在 fixed 布局下强制压缩、文字换行
+  - 上下：不合并 → 内容区高度比 PDF 实际小，atLeast 行高的表格在 WPS 下
+    因剩余空间不足把整行推到下一页（见下方"上边距取中位数"反模式）
+
+**为什么上边距也用 `min()` 而非中位数**（曾导致的问题）：
+- 表格页的表格边框顶到 y=72pt，但同一页文字 span 顶在 y=80pt（cell 内边距+首行文字）
+- 上边距取中位数（80pt）会丢失"表格从 72pt 开始"的信息，内容区高度比 PDF 实际小 7.8pt
+- 当某页表格总高恰好填满 PDF 内容区（如 1.20-1.24 五行=690pt=PDF内容区），
+  DOCX 内容区只有 682pt，WPS 把放不下的最后一行（1.24）整体推到下一页
+- LibreOffice 分页较宽松能放下，但 WPS 严格执行 → 渲染引擎差异暴露了边距偏小
 
 ### 规则 6：标题分类——结构标题 vs 视觉标题
 
@@ -138,23 +153,25 @@
 
 - 用 `page.find_tables()` 获取 PyMuPDF Table 对象
 - 从 `table.cells` 的 x 坐标边界计算列宽
-- 通过 OOXML `tblGrid` + `tblLayout type=fixed` 设置（不是 `cell.width`，LibreOffice 忽略后者）
+- 通过 OOXML `tblGrid` + `tblLayout type=fixed` + `tblW type=auto` 设置
+  （`tblW=dxa` 固定值可能因舍入误差被 Word 压缩，`auto` 更可靠）
+- 列宽乘以 1.014 补偿系数（见规则 16）
 
-### 规则 8：表格行高与 cell 行距——同源、先设行高再填 cell
+### 规则 8：表格行高与 cell 行距——atLeast 模式，不裁剪内容
 
-trHeight（OOXML `trHeight`）和 cell 段落 `line_spacing` 必须满足：
-`line_spacing × cell文字行数 ≤ trHeight`，否则 exact 模式下内容被裁剪。
+trHeight（OOXML `trHeight`）用 `atLeast` 模式——行高至少为 PDF 值，
+DOCX 渲染时字体宽度差异可能导致实际行数多于 PDF（见规则 16），
+atLeast 允许行高自适应增长，避免底部内容被裁剪。
 
 **实现要点**：
 - **先设 trHeight，再调 `_fill_table_cells`**——cell 填充时需读取 trHeight 做安全约束
-- trHeight 和 line_spacing **用同一个缩放后的 row_h**，不能各自取不同基准
-- line_spacing 安全约束：`safe_lh = min(文字间距, trHeight / cell文字行数)`
-- row_h 微缩 2% 给行间呼吸空间，但 trHeight 和 line_spacing 必须同时缩放
+- line_spacing 安全约束：`safe_lh = min(文字间距, trHeight / (cell文字行数+0.5))`
+- row_h 微缩 2%（`scaled_h = row_h * 0.98`），trHeight 和 line_spacing 统一用此值
 
 **禁止的做法**：
 - 用 block bbox 高度 / 1 作为 table block 的 line_height（= 表格总高 600pt）
 - 用文档中位数作为表格行距（与正文行距混淆）
-- `atLeast` 模式（内容溢出时行高膨胀，导致表格跨页数翻倍）——用 `exact`
+- `exact` 模式（字体宽度差异导致实际行数多于预期时裁剪底部内容）
 
 ### 规则 9：跨页表格数据合并——首页主 block 收集全部 PyMuPDF 数据
 
@@ -232,6 +249,24 @@ Word 会自然分页——主行在上一页底部、续行在下一页顶部，
 - 用 `html.unescape()` 替代手写 `re.sub(r"&nbsp;", ...)` 逐个替换
 - 避免遗漏 `&lt;`、`&gt;`、`&quot;` 等实体
 
+### 规则 16：表格列宽字体度量补偿——×1.014 系数
+
+Windows 安装的 FangSong 和 TimesNewRoman 字符宽度比 PDF 内嵌字体平均宽约 **1.4%**
+（实测比例：FangSong=1.0143，TimesNewRoman=1.0142，SimHei=0.9506）。
+不补偿会导致接近 cell 宽度的行（如33字=396pt）超出 cell 列宽（395pt）触发换行。
+
+**实现**：在 `_set_table_fixed_width` 中，gridCol 列宽统一乘以 1.014：
+```python
+col_widths_dxa = [round(w * 20 * 1.014) for w in col_widths_pt]
+```
+
+**为什么对所有列统一补偿**：
+- FangSong 和 TimesNewRoman 比例几乎相同（1.014），文档主要用这两种字体
+- SimHei 比例 0.95（更窄），多补偿只会让它更宽松，不会换行
+- 逐字体按比例补偿过于复杂且收益有限
+
+**验证**：补偿后 cell1 从 395pt→400.6pt，33字 FangSong（396pt）能完整放下一行。
+
 ---
 
 ## 反模式清单（禁止再次出现）
@@ -256,7 +291,7 @@ Word 会自然分页——主行在上一页底部、续行在下一页顶部，
 | cell 统一用 block._style | 条款号 "1.1" 显示为 FangSong 而非 TimesNewRomanPSMT | 按 cell 从 PDF 提取主导字体 |
 | trHeight 和 line_spacing 不同源 | line_spacing × 行数 > trHeight，exact 模式内容裁剪 | 统一用缩放后的 row_h |
 | 先填 cell 再设 trHeight | 安全约束读不到 trHeight，溢出检测失效 | 先设 trHeight 再填 cell |
-| `atLeast` 行高模式 | 内容溢出时行高膨胀，表格从3页变8页 | 用 `exact` 模式 |
+| `atLeast` 行高模式 | ~~内容溢出时行高膨胀~~ → 实际是 exact 模式裁剪内容 | 统一用 `atLeast`，允许行高自适应 |
 | 跨页续页 block 不标记 | 同一表格被渲染两次（94页） | 续页标记 `_table_merged` |
 | MinerU 漏检表格不补救 | 整页表格变散落文本段落 | PyMuPDF find_tables 交叉校验重建 |
 | cell 行间距含跨列 y0 | 不同列文字的 y0 差被误算为行间距（13.2pt） | 按列分组后算同列内 y0 差值 |
@@ -264,6 +299,12 @@ Word 会自然分页——主行在上一页底部、续行在下一页顶部，
 | 合并跨页续行 | 行高累加超单页（498pt），exact 模式整行推到下一页；safe_lh 索引错位致 line_spacing=1pt | 不合并，保留 PyMuPDF 原始分页行结构 |
 | `_fill_table_cells` 的 row_tr_heights 跳过无 trHeight 行 | 索引错位，行N读到行N+1的 trHeight，safe_lh 算出 1pt 行距 | row_tr_heights 与 table.rows 一一对应（含 None） |
 | 用行数差异触发 PyMuPDF 重建 | 跨页合并后 HTML 和 PyMuPDF 行数可能恰好接近（33 vs 33） | 用 `_table_crosspage` 标记触发 |
+| 用 MinerU HTML 重建表格 | AI 推理有 OCR 错误、续行拆分、文本错位 | 统一用 PyMuPDF 重建路径（文字100%准确） |
+| Table Grid 样式的默认 cell margin | 左右各5.4pt 吃掉 cell 宽度导致换行 | 不用 TableGrid 样式，手动加边框 + tcMar=0 |
+| span 间空格未去除 | PyMuPDF 分隔符空格在 CJK 字体下占12pt，每行多出12pt | 渲染 span 时 `sp_text.strip()` |
+| 表格列宽不加字体度量补偿 | Windows FangSong 比 PDF 内嵌宽1.4%，接近行宽的文字超出cell换行 | gridCol × 1.014 补偿系数 |
+| 上边距取中位数 + 不合并表格bbox顶部 | 表格边框顶72pt但文字span在80pt，内容区比PDF小7.8pt；填满PDF的表格页在WPS下最后一行被推到下一页 | 四边边距都取min()且合并表格bbox |
+| 只合并表格bbox的左右边界，忽略上下边界 | 表格页内容区高度不足，atLeast表格行被WPS整体推到下页 | 上下左右都合并表格bbox |
 
 ---
 

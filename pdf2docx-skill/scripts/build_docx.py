@@ -871,6 +871,33 @@ def _extract_table_html(block: dict[str, Any]) -> str:
     return ""
 
 
+def _apply_table_borders(table) -> None:
+    """
+    手动给表格添加边框（替代 Table Grid 样式）。
+
+    不用 Table Grid 样式是因为它自带 tblCellMar 默认内边距（左右各5.4pt），
+    即使在 tblPr 中设 tblCellMar=0，LibreOffice 仍会用样式的默认值。
+    不设 style 时表格无默认内边距，cell 可用宽度 = 列宽全宽。
+    """
+    from docx.oxml.ns import qn
+    from docx.oxml import OxmlElement
+
+    tblPr = table._tbl.tblPr
+    tblBorders = tblPr.find(qn('w:tblBorders'))
+    if tblBorders is None:
+        tblBorders = OxmlElement('w:tblBorders')
+        tblPr.append(tblBorders)
+    for side in ('top', 'left', 'bottom', 'right', 'insideH', 'insideV'):
+        b = tblBorders.find(qn(f'w:{side}'))
+        if b is None:
+            b = OxmlElement(f'w:{side}')
+            tblBorders.append(b)
+        b.set(qn('w:val'), 'single')
+        b.set(qn('w:sz'), '4')  # 0.5pt
+        b.set(qn('w:space'), '0')
+        b.set(qn('w:color'), '000000')
+
+
 def _set_table_fixed_width(table, col_widths_pt: list[float]) -> None:
     """
     设置表格为固定列宽布局，直接操作 OOXML。
@@ -901,7 +928,10 @@ def _set_table_fixed_width(table, col_widths_pt: list[float]) -> None:
 
     # 2. 更新 tblGrid 的 gridCol（列宽定义）
     # pt → twips(dxa)：1pt = 20 twips
-    col_widths_dxa = [round(w * 20) for w in col_widths_pt]
+    # 补偿系数 1.014：Windows 安装的 FangSong/TimesNewRoman 字符宽度
+    # 比 PDF 内嵌字体平均宽约 1.4%（实测比例 1.0142-1.0143），
+    # 不补偿会导致接近 cell 宽度的行在 Word 中多换一行。
+    col_widths_dxa = [round(w * 20 * 1.014) for w in col_widths_pt]
     total_dxa = sum(col_widths_dxa)
 
     tblGrid = tbl.find(qn('w:tblGrid'))
@@ -914,13 +944,15 @@ def _set_table_fixed_width(table, col_widths_pt: list[float]) -> None:
             gridCol.set(qn('w:w'), str(w))
             tblGrid.append(gridCol)
 
-    # 3. tblW type=dxa（表格总宽度固定）
+    # 3. tblW type=auto（表格宽度由 gridCol 决定，不设固定值）
+    #    设固定值(dxa)时，Word 可能因舍入误差认为表格超出内容区而压缩列宽。
+    #    auto 模式下 Word 直接用 gridCol 值，列宽精确不被压缩。
     tblW = tblPr.find(qn('w:tblW'))
     if tblW is None:
         tblW = OxmlElement('w:tblW')
         tblPr.append(tblW)
-    tblW.set(qn('w:type'), 'dxa')
-    tblW.set(qn('w:w'), str(total_dxa))
+    tblW.set(qn('w:type'), 'auto')
+    tblW.set(qn('w:w'), '0')
 
     # 4. 逐 cell 设 tcW（与 gridCol 一致）
     for row in table.rows:
@@ -1046,18 +1078,87 @@ def _enrich_rows_with_pymupdf_text(
                 cell_data["text"] = best_match
 
 
+def _infer_colspan_rowspan(pymupdf_table) -> list[list[dict[str, Any]]] | None:
+    """
+    从 PyMuPDF Table 的 cell 物理边界推断 colspan/rowspan。
+
+    PyMuPDF 的 row.cells 返回每个物理 cell 的 bbox 或 None：
+    - None → 被上方/左方的 cell 合并占据
+    - bbox 跨多行 → rowspan > 1（y 范围覆盖多个行高）
+    - bbox 跨多列 → colspan > 1（x 范围覆盖多个列宽）
+
+    返回 rows_data[r][c] = {"text": ..., "rowspan": int, "colspan": int}
+    被 None 占据的位置返回 {"text": "", "rowspan": 0, "colspan": 0}（跳过标记）。
+    """
+    if pymupdf_table is None:
+        return None
+
+    rows = list(pymupdf_table.rows)
+    n_rows = len(rows)
+    if n_rows == 0:
+        return None
+
+    # 收集行边界（y0）和列边界（x0）
+    row_ys = [r.bbox[1] for r in rows]
+    # 列边界从第一行的 cell x 坐标收集
+    col_xs = set()
+    for cell in rows[0].cells:
+        if cell:
+            col_xs.add(round(cell[0]))
+            col_xs.add(round(cell[2]))
+    col_xs = sorted(col_xs)
+    n_cols = len(col_xs) - 1 if len(col_xs) >= 2 else 1
+    if n_cols < 1:
+        return None
+
+    # 构建 rows_data
+    rows_data: list[list[dict[str, Any]]] = []
+    for ri in range(n_rows):
+        row_data: list[dict[str, Any]] = []
+        pm_cells = rows[ri].cells
+        for ci in range(n_cols):
+            if ci < len(pm_cells) and pm_cells[ci] is not None:
+                cell_bbox = pm_cells[ci]
+                # 计算这个 cell 跨了多少行
+                cx0, cy0, cx1, cy1 = cell_bbox
+                rowspan = 0
+                for ry in row_ys:
+                    if cy0 - 1 <= ry <= cy1 + 1:
+                        rowspan += 1
+                rowspan = max(1, rowspan)
+                # 计算跨了多少列
+                colspan = 0
+                for cx in col_xs[:-1]:
+                    if cx0 - 1 <= cx <= cx1 + 1:
+                        colspan += 1
+                colspan = max(1, colspan)
+                row_data.append({"text": "", "rowspan": rowspan, "colspan": colspan})
+            else:
+                # 被合并的位置
+                row_data.append({"text": "", "rowspan": 0, "colspan": 0})
+        rows_data.append(row_data)
+
+    # 填入 extract() 的文本（只填非合并位置）
+    extracted = pymupdf_table.extract()
+    for ri in range(min(n_rows, len(extracted))):
+        for ci in range(min(n_cols, len(extracted[ri]))):
+            if ri < len(rows_data) and ci < len(rows_data[ri]):
+                if rows_data[ri][ci]["rowspan"] > 0:
+                    rows_data[ri][ci]["text"] = extracted[ri][ci] or ""
+
+    return rows_data
+
+
 def _build_table_from_pymupdf(
     doc, block: dict[str, Any], pymupdf_cells: list[list[str]],
+    pymupdf_table=None,
 ) -> None:
     """
     从 PyMuPDF 表格数据直接构建 DOCX 表格。
 
-    用于两种场景：
-    1. MinerU 未提供 HTML（如某些页的跨页续表）
-    2. 跨页表格：MinerU HTML 的行结构有 AI 推理错误（续行拆分+OCR错位），
-       PyMuPDF 原始行结构更准确，直接用它重建。
-
     pymupdf_cells: PyMuPDF extract() 返回的 cell 文本矩阵 [row][col]
+    pymupdf_table: PyMuPDF Table 对象（可选），用于推断 colspan/rowspan。
+      传入时从 cell 物理边界推断合并单元格；不传时所有 cell 默认无合并。
     """
     n_rows = len(pymupdf_cells)
     n_cols = max((len(row) for row in pymupdf_cells), default=1)
@@ -1065,10 +1166,7 @@ def _build_table_from_pymupdf(
         return
 
     table = doc.add_table(rows=n_rows, cols=n_cols)
-    try:
-        table.style = "Table Grid"
-    except KeyError:
-        pass
+    _apply_table_borders(table)
 
     # 列宽
     col_widths = block.get("_col_widths")
@@ -1080,18 +1178,25 @@ def _build_table_from_pymupdf(
     table_lh = block.get("_table_line_height") or block.get("_doc_line_height")
     row_line_heights = block.get("_table_row_line_heights")
 
-    # 转换为 rows 格式：[[{"text": ..., "rowspan": 1, "colspan": 1}, ...], ...]
-    rows_data = []
-    for ri in range(n_rows):
-        row = []
-        for ci in range(min(n_cols, len(pymupdf_cells[ri]) if ri < len(pymupdf_cells) else 0)):
-            row.append({"text": pymupdf_cells[ri][ci] or "", "rowspan": 1, "colspan": 1})
-        rows_data.append(row)
+    # 构建 rows_data：优先用 cell 边界推断 colspan/rowspan
+    inferred = _infer_colspan_rowspan(pymupdf_table) if pymupdf_table else None
+    if inferred and len(inferred) == n_rows:
+        rows_data = inferred
+    else:
+        rows_data = []
+        for ri in range(n_rows):
+            row = []
+            for ci in range(min(n_cols, len(pymupdf_cells[ri]) if ri < len(pymupdf_cells) else 0)):
+                row.append({"text": pymupdf_cells[ri][ci] or "", "rowspan": 1, "colspan": 1})
+            rows_data.append(row)
 
     # 先设行高，再填 cell
+    # PyMuPDF 重建路径用 atLeast 模式：PyMuPDF 的 break 位置基于 PDF 字体宽度，
+    # 但 DOCX 渲染时系统字体宽度不同（即使同名），实际行数可能多于 break 数。
+    # exact 模式会裁剪多出的行；atLeast 允许行高自适应。
     row_heights = block.get("_table_row_heights")
     if row_heights and len(row_heights) == n_rows:
-        _set_table_row_heights(table, row_heights)
+        _set_table_row_heights(table, row_heights, rule="atLeast")
 
     _fill_table_cells(table, rows_data, block.get("_style"), table_lh,
                       row_line_heights, cell_styles)
@@ -1099,90 +1204,52 @@ def _build_table_from_pymupdf(
 
 def _build_table(doc, block: dict[str, Any]) -> None:
     """
-    表格：优先解析 MinerU HTML，无 HTML 时从 PyMuPDF 数据重建。
+    表格重建：统一用 PyMuPDF 数据重建。
+
+    MinerU HTML 是 AI 推理结果，存在 OCR 错误、续行拆分、文本错位等问题。
+    PyMuPDF extract() 是 PDF 结构直接提取，文字准确、行结构忠实于原 PDF。
+    合并单元格（colspan/rowspan）从 PyMuPDF cell 物理边界推断。
+    无 PyMuPDF 数据时才回退到 MinerU HTML。
     """
     # 跳过已被跨页合并处理的续页 block
     if block.get("_table_merged"):
         return
 
-    table_html = _extract_table_html(block)
     pymupdf_cells = block.get("_pymupdf_cells")
 
+    # 优先走 PyMuPDF 重建路径
+    if pymupdf_cells:
+        pm_table = block.get("_pymupdf_table")
+        _build_table_from_pymupdf(doc, block, pymupdf_cells, pymupdf_table=pm_table)
+        return
+
+    # 回退：无 PyMuPDF 数据时用 MinerU HTML
+    table_html = _extract_table_html(block)
     if not table_html:
-        # MinerU 未提供 HTML（如某些页的跨页续表），从 PyMuPDF 数据重建
-        if pymupdf_cells:
-            _build_table_from_pymupdf(doc, block, pymupdf_cells)
         return
 
     rows = _parse_html_table(table_html)
     if not rows:
         return
 
-    # ── 跨页表格：直接用 PyMuPDF 原始行结构重建 ──
-    # MinerU HTML 是 AI 推理结果，跨页大单元格常被错误拆成多余 <tr>
-    # （如 1.15 条目跨页，MinerU 拆成3行+文本错位+OCR重复）。
-    # PyMuPDF extract() 是 PDF 结构直接提取，文字100%准确。
-    #
-    # 跨页大单元格在 PDF 中物理上就是分段的（如 1.15 在第8页底部67pt +
-    # 第9页顶部432pt），PyMuPDF 正确地把它们识别为两行（续行 col0 为空）。
-    # 直接用这个原始结构重建表格，每行用 PDF 真实行高（exact 模式），
-    # Word 会自然分页——主行在上一页底部、续行在下一页顶部，完美复刻 PDF。
-    # 不合并续行（合并后行高过大无法跨页，且破坏 PDF 原始结构）。
-    n_cols_pm = len(pymupdf_cells[0]) if pymupdf_cells else 0
-    if pymupdf_cells and block.get("_table_crosspage") and n_cols_pm == 2:
-        print(f"  ℹ️ 跨页表格用PyMuPDF原始结构重建: {len(pymupdf_cells)}行"
-              f"(含跨页续行)", file=sys.stderr)
-        _build_table_from_pymupdf(doc, block, pymupdf_cells)
-        return
-
-    # ── 合并续行（MinerU 将单元格溢出行错误拆分为独立 tr）──
-    # 跨页表格中，大单元格的文字溢出时 MinerU 会生成多余的 <tr>
-    # 这些"续行"特征：col0 不像条款号（不是 "1.1" 格式）。
-    # 但是合并后的行高无法精确匹配 PDF 原始行高（trHeight 不匹配），
-    # 且合并会增加每行文本量导致 Word 自然换行更多。
-    # 暂时关闭，待 trHeight 跨页映射方案完善后再启用。
-    # rows = _merge_continuation_rows(rows)
-
-    # 计算实际列数（考虑 colspan）
     max_cols = max(sum(c.get("colspan", 1) for c in row) for row in rows)
     table = doc.add_table(rows=len(rows), cols=max_cols)
-    try:
-        table.style = "Table Grid"
-    except KeyError:
-        pass  # 无 Table Grid 样式时用默认
+    _apply_table_borders(table)
 
-    # ── 设置固定列宽（匹配原文 PDF）──
-    # MinerU HTML 不含列宽，_col_widths 由 build_docx 预扫描用 PyMuPDF
-    # find_tables 提取后注入。无此字段时保持默认等宽。
     col_widths = block.get("_col_widths")
     if col_widths and len(col_widths) == max_cols:
         _set_table_fixed_width(table, col_widths)
     else:
-        # 列宽数与 max_cols 不匹配（可能 PyMuPDF 检测的列数与 HTML 不一致）
-        if col_widths and len(col_widths) != max_cols:
-            print(f"  ⚠️ 表格列宽不匹配: PyMuPDF={len(col_widths)}列 vs HTML={max_cols}列，回退等宽",
-                  file=sys.stderr)
         table.autofit = True
 
-    # ── 恢复单元格内换行（PyMuPDF extract() 保留 \n）──
-    # MinerU HTML 把单元格内多行内容合并成无换行的扁平字符串，
-    # 用 PyMuPDF 的 extract() 文本恢复换行格式。
-    pymupdf_cells = block.get("_pymupdf_cells")
-    if pymupdf_cells:
-        _enrich_rows_with_pymupdf_text(rows, pymupdf_cells)
-
-    # ── 修复跨页表格的单元格错位（在 PyMuPDF 文本增强之后）──
-    # 用 PyMuPDF 数据作为基准：如果 PyMuPDF 显示 col0 为空但 HTML 有文本 → 错位
+    _enrich_rows_with_pymupdf_text(rows, pymupdf_cells)
     _fix_crosspage_cell_misplacement(rows, pymupdf_cells)
 
-    # cell 段落行距：优先用表格内文字行高，回退到文档行高
     table_lh = block.get("_table_line_height") or block.get("_doc_line_height")
     row_line_heights = block.get("_table_row_line_heights")
-
-    # 先设行高（在 _fill_table_cells 之前），使 cell 行距可约束于 trHeight
     row_heights = block.get("_table_row_heights")
     if row_heights and len(row_heights) == len(table.rows):
-        _set_table_row_heights(table, row_heights)
+        _set_table_row_heights(table, row_heights, rule="atLeast")
 
     _fill_table_cells(table, rows, block.get("_style"), table_lh, row_line_heights,
                       block.get("_table_cell_styles"))
@@ -1445,6 +1512,11 @@ def _fill_table_cells(table, rows: list[list[dict[str, Any]]],
                         sp_text = sp.get("text") or ""
                         if not sp_text.strip():
                             continue
+                        # 去掉 span 文本开头/末尾的空格
+                        # PyMuPDF 在不同字体 span 间会插入空格作为分隔符，
+                        # 这个空格在 CJK 字体下占全角宽度（12pt），
+                        # 导致行总宽度超出 cell 而触发换行
+                        sp_text = sp_text.strip()
                         sp_y = sp.get("_y")
                         if prev_y is not None and sp_y is not None:
                             if abs(sp_y - prev_y) >= 5 and not natural_wrap:
@@ -1669,10 +1741,30 @@ def _detect_page_margins(pdf_path: str, pdf_info: list) -> dict[str, float] | No
                     x0s.append(bx[0])
                     x1s.append(bx[2])
         if y0s and y1s:
-            top_margins.append(min(y0s))
-            bottom_margins.append(ph - max(y1s))
-            left_margins.append(min(x0s))
-            right_margins.append(pw - max(x1s))
+            # 上下左右边距：都要同时考虑文字 span 和表格 bbox 的边界。
+            # 表格边框线比文字 span 更靠外（cell 有内边距，且表格可能比正文更宽更高）。
+            # - 左右：不合并 → 内容区比表格窄，cell 被压缩、文字换行
+            # - 上下：不合并 → 内容区高度比 PDF 实际小（表格顶到72pt但文字span在80pt），
+            #   atLeast 行高的表格在 WPS 下因剩余空间不足把整行推到下一页。
+            top_min = min(y0s)
+            bottom_max = max(y1s)
+            left_min = min(x0s)
+            right_max = max(x1s)
+            try:
+                for tab in page.find_tables().tables:
+                    # 排除页脚位置的表格（如全宽页脚表），避免污染边距统计
+                    if tab.bbox[1] >= ph - 60:
+                        continue
+                    top_min = min(top_min, tab.bbox[1])
+                    bottom_max = max(bottom_max, tab.bbox[3])
+                    left_min = min(left_min, tab.bbox[0])
+                    right_max = max(right_max, tab.bbox[2])
+            except Exception:
+                pass
+            top_margins.append(top_min)
+            bottom_margins.append(ph - bottom_max)
+            left_margins.append(left_min)
+            right_margins.append(pw - right_max)
 
     doc.close()
 
@@ -1683,13 +1775,19 @@ def _detect_page_margins(pdf_path: str, pdf_info: list) -> dict[str, float] | No
     bottom_margins.sort()
     left_margins.sort()
     right_margins.sort()
-    mid = len(top_margins) // 2
 
     return {
-        "top": top_margins[mid],         # 中位数
+        # 上下左右边距都取最小值：内容最靠四边的页反映真实可用内容区。
+        # 上边距用中位数曾导致表格页（表格边框顶到 72pt，但文字 span 在 80pt）
+        # 的上边距被高估为 80pt，内容区高度比 PDF 实际小 7.8pt，
+        # atLeast 行高的表格在 WPS 下因剩余空间不足把整行推到下一页。
+        "top": min(top_margins),
         "bottom": min(bottom_margins),   # 最小值（内容最满的页反映真实下边距）
-        "left": left_margins[mid],
-        "right": right_margins[mid],
+        # 左右边距取最小值：确保内容区足够宽以容纳最宽的内容（如跨页表格）。
+        # 用中位数会导致表格页（bbox 更宽）的内容超出内容区，
+        # 被 Word/WPS 在 fixed 布局下强制压缩，cell 变窄、文字换行。
+        "left": min(left_margins),
+        "right": min(right_margins),
     }
 
 
@@ -1809,6 +1907,7 @@ def build_docx(
                         cell_texts = _extract_table_cell_texts(mtable)
                         if cell_texts:
                             block["_pymupdf_cells"] = cell_texts
+                            block["_pymupdf_table"] = mtable  # 保存对象用于推断合并单元格
                             texts_found += 1
                         cell_styles = _extract_table_cell_styles(mtable, fitz_page)
                         if cell_styles:
