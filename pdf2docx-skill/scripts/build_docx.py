@@ -871,6 +871,24 @@ def _extract_table_html(block: dict[str, Any]) -> str:
     return ""
 
 
+def _html_has_merged_cells(table_html: str) -> bool:
+    """
+    检测 MinerU HTML 是否含合并单元格（colspan>1 或 rowspan>1）。
+
+    用于决定表格重建路径：
+    - 含合并单元格 → MinerU HTML 的结构更可靠（AI 视觉能正确识别合并），
+      走 HTML 路径。PyMuPDF 的 find_tables() 对含 colspan/rowspan 的复杂表格
+      cell 边界检测不可靠（会把每个 cell 都报告成跨满宽，导致全部误判为 colspan=2）。
+    - 不含合并单元格 → 走 PyMuPDF 路径（避免 MinerU 的 OCR 错误/续行拆分）。
+    """
+    if not table_html:
+        return False
+    for m in re.finditer(r'(?:colspan|rowspan)\s*=\s*["\']?(\d+)', table_html, re.I):
+        if int(m.group(1)) > 1:
+            return True
+    return False
+
+
 def _apply_table_borders(table) -> None:
     """
     手动给表格添加边框（替代 Table Grid 样式）。
@@ -1018,6 +1036,8 @@ def _enrich_rows_with_pymupdf_text(
     （双向取较短者比较），避免空格/换行差异导致漏匹配。
     """
     n_rows_html = len(rows)
+    if not pymupdf_cells:
+        return  # 无 PyMuPDF 数据，保留 HTML 原文
     n_rows_pm = len(pymupdf_cells)
     n_cols_pm = len(pymupdf_cells[0]) if pymupdf_cells else 0
 
@@ -1204,27 +1224,58 @@ def _build_table_from_pymupdf(
 
 def _build_table(doc, block: dict[str, Any]) -> None:
     """
-    表格重建：统一用 PyMuPDF 数据重建。
+    表格重建：根据表格特征选择数据源。
 
-    MinerU HTML 是 AI 推理结果，存在 OCR 错误、续行拆分、文本错位等问题。
-    PyMuPDF extract() 是 PDF 结构直接提取，文字准确、行结构忠实于原 PDF。
-    合并单元格（colspan/rowspan）从 PyMuPDF cell 物理边界推断。
-    无 PyMuPDF 数据时才回退到 MinerU HTML。
+    路径选择策略（由 HTML 合并单元格特征决定）：
+    - **含合并单元格（colspan>1 或 rowspan>1）→ MinerU HTML 路径**：
+      这类复杂表格 PyMuPDF 的 find_tables() cell 边界检测不可靠（会把每个 cell
+      都报告成跨满宽，导致 _infer_colspan_rowspan 全部误判为 colspan=2）。
+      MinerU 的 AI 视觉能正确识别合并结构。文本仍用 PyMuPDF 增强（更准确）。
+    - **不含合并单元格 → PyMuPDF 路径**（默认）：
+      PyMuPDF extract() 是 PDF 结构直接提取，文字 100% 准确、行结构忠实于原 PDF，
+      避免 MinerU HTML 的 OCR 错误、续行拆分、文本错位等问题。
     """
     # 跳过已被跨页合并处理的续页 block
     if block.get("_table_merged"):
         return
 
     pymupdf_cells = block.get("_pymupdf_cells")
+    table_html = _extract_table_html(block)
 
-    # 优先走 PyMuPDF 重建路径
+    # 含合并单元格的复杂表格 → HTML 路径（结构更可靠）
+    if _html_has_merged_cells(table_html):
+        rows = _parse_html_table(table_html)
+        if rows:
+            max_cols = max(sum(c.get("colspan", 1) for c in row) for row in rows)
+            table = doc.add_table(rows=len(rows), cols=max_cols)
+            _apply_table_borders(table)
+
+            col_widths = block.get("_col_widths")
+            if col_widths and len(col_widths) == max_cols:
+                _set_table_fixed_width(table, col_widths)
+            else:
+                table.autofit = True
+
+            # 用 PyMuPDF 精确文本增强 HTML 行（PyMuPDF 文字无 OCR 错误）
+            _enrich_rows_with_pymupdf_text(rows, pymupdf_cells)
+
+            table_lh = block.get("_table_line_height") or block.get("_doc_line_height")
+            row_line_heights = block.get("_table_row_line_heights")
+            row_heights = block.get("_table_row_heights")
+            if row_heights and len(row_heights) == len(table.rows):
+                _set_table_row_heights(table, row_heights, rule="atLeast")
+
+            _fill_table_cells(table, rows, block.get("_style"), table_lh, row_line_heights,
+                              block.get("_table_cell_styles"))
+            return
+
+    # 默认：PyMuPDF 重建路径（简单表格，文字更准确）
     if pymupdf_cells:
         pm_table = block.get("_pymupdf_table")
         _build_table_from_pymupdf(doc, block, pymupdf_cells, pymupdf_table=pm_table)
         return
 
     # 回退：无 PyMuPDF 数据时用 MinerU HTML
-    table_html = _extract_table_html(block)
     if not table_html:
         return
 

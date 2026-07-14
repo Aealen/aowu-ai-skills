@@ -155,12 +155,12 @@
 - 从 `table.cells` 的 x 坐标边界计算列宽
 - 通过 OOXML `tblGrid` + `tblLayout type=fixed` + `tblW type=auto` 设置
   （`tblW=dxa` 固定值可能因舍入误差被 Word 压缩，`auto` 更可靠）
-- 列宽乘以 1.014 补偿系数（见规则 16）
+- 列宽乘以 1.014 补偿系数（见规则 17）
 
 ### 规则 8：表格行高与 cell 行距——atLeast 模式，不裁剪内容
 
 trHeight（OOXML `trHeight`）用 `atLeast` 模式——行高至少为 PDF 值，
-DOCX 渲染时字体宽度差异可能导致实际行数多于 PDF（见规则 16），
+DOCX 渲染时字体宽度差异可能导致实际行数多于 PDF（见规则 17），
 atLeast 允许行高自适应增长，避免底部内容被裁剪。
 
 **实现要点**：
@@ -238,18 +238,39 @@ Word 会自然分页——主行在上一页底部、续行在下一页顶部，
 - 对多列表格（4列+）走此路径——其 col0 空行可能是 rowspan 合并单元格
 - 盲信 MinerU HTML 行结构——AI 推理有 OCR 错误和续行拆分错误
 
-### 规则 14：图片尺寸——从 block bbox 提取
+### 规则 14：复杂合并表格——HTML 含 colspan/rowspan 时走 HTML 路径，不走 PyMuPDF
+
+PyMuPDF `find_tables()` 对**含 colspan/rowspan 的复杂表格** cell 边界检测不可靠：
+会把每个 cell 的 bbox 都报告成跨满表格宽度，导致 `_infer_colspan_rowspan` 把
+所有 cell 都误判为 colspan=2（如第14页表格被全部合并成一列，文本错乱混合）。
+
+**MinerU 的 AI 视觉对此类表格的合并结构识别更可靠**——HTML 准确标注了哪些
+cell 是 colspan=2、哪些是 colspan=1。
+
+**路径选择策略**（`_build_table` 由 `_html_has_merged_cells` 决定）：
+| 表格特征 | 路径 | 原因 |
+|---------|------|------|
+| HTML 含 colspan>1 或 rowspan>1 | **HTML 路径** | PyMuPDF cell 边界对复杂表格不可靠，HTML 结构更准 |
+| HTML 不含合并（简单表格） | **PyMuPDF 路径**（默认） | 避免 MinerU 的 OCR 错误/续行拆分 |
+
+**HTML 路径仍用 PyMuPDF 增强文本**：`_enrich_rows_with_pymupdf_text` 用 PyMuPDF
+精确文本替换 HTML 的 OCR 文本（结构用 HTML，文字用 PyMuPDF，各取所长）。
+
+**判别信号可靠性**：跨页条款表（1.1-1.28）的 HTML 全是 colspan=1（简单表格），
+不会被误判为复杂表格。全文仅 5 个表格（第14/54/56/70/83页）含合并单元格。
+
+### 规则 15：图片尺寸——从 block bbox 提取
 
 - `width_in = (bbox[2] - bbox[0]) / 72`
 - 加上限保护：不超过页面内容宽度
 - 无 bbox 时回退到内容宽度
 
-### 规则 15：HTML 实体——用标准库，不全手写
+### 规则 16：HTML 实体——用标准库，不全手写
 
 - 用 `html.unescape()` 替代手写 `re.sub(r"&nbsp;", ...)` 逐个替换
 - 避免遗漏 `&lt;`、`&gt;`、`&quot;` 等实体
 
-### 规则 16：表格列宽字体度量补偿——×1.014 系数
+### 规则 17：表格列宽字体度量补偿——×1.014 系数
 
 Windows 安装的 FangSong 和 TimesNewRoman 字符宽度比 PDF 内嵌字体平均宽约 **1.4%**
 （实测比例：FangSong=1.0143，TimesNewRoman=1.0142，SimHei=0.9506）。
@@ -299,7 +320,10 @@ col_widths_dxa = [round(w * 20 * 1.014) for w in col_widths_pt]
 | 合并跨页续行 | 行高累加超单页（498pt），exact 模式整行推到下一页；safe_lh 索引错位致 line_spacing=1pt | 不合并，保留 PyMuPDF 原始分页行结构 |
 | `_fill_table_cells` 的 row_tr_heights 跳过无 trHeight 行 | 索引错位，行N读到行N+1的 trHeight，safe_lh 算出 1pt 行距 | row_tr_heights 与 table.rows 一一对应（含 None） |
 | 用行数差异触发 PyMuPDF 重建 | 跨页合并后 HTML 和 PyMuPDF 行数可能恰好接近（33 vs 33） | 用 `_table_crosspage` 标记触发 |
-| 用 MinerU HTML 重建表格 | AI 推理有 OCR 错误、续行拆分、文本错位 | 统一用 PyMuPDF 重建路径（文字100%准确） |
+| 简单表格用 MinerU HTML 重建 | AI 推理有 OCR 错误、续行拆分、文本错位 | 简单表格用 PyMuPDF 重建路径（文字100%准确） |
+| 含合并单元格的复杂表格用 PyMuPDF 重建 | PyMuPDF 把每个 cell bbox 都报成跨满宽，_infer_colspan_rowspan 全判 colspan=2，表格被压成一列 | HTML 含 colspan/rowspan 时走 HTML 路径（结构用HTML+文字用PyMuPDF增强） |
+| PyMuPDF 全量适用假设 | 跨页简单表格 PyMuPDF 更准，但含 colspan/rowspan 复杂表格 HTML 更准 | 按 HTML 合并单元格特征分路径（规则14） |
+| `_enrich_rows_with_pymupdf_text` 不检查 None | 无 PyMuPDF 数据的表格 block 传入 None 触发 `len(None)` 崩溃 | 函数开头 `if not pymupdf_cells: return` |
 | Table Grid 样式的默认 cell margin | 左右各5.4pt 吃掉 cell 宽度导致换行 | 不用 TableGrid 样式，手动加边框 + tcMar=0 |
 | span 间空格未去除 | PyMuPDF 分隔符空格在 CJK 字体下占12pt，每行多出12pt | 渲染 span 时 `sp_text.strip()` |
 | 表格列宽不加字体度量补偿 | Windows FangSong 比 PDF 内嵌宽1.4%，接近行宽的文字超出cell换行 | gridCol × 1.014 补偿系数 |
