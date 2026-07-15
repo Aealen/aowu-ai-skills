@@ -1226,14 +1226,21 @@ def _infer_colspan_rowspan(pymupdf_table) -> list[list[dict[str, Any]]] | None:
 
     # 收集行边界（y0）和列边界（x0）
     row_ys = [r.bbox[1] for r in rows]
-    # 列边界从第一行的 cell x 坐标收集
+    # 列边界遍历**所有行**的 cell x 坐标收集（而非只看第一行）。
+    # 原因：第一行可能是跨满宽的合并 cell（colspan=N），只有1个 cell，
+    # 从它收集到的列边界只有2个点（左/右），会严重低估列数。
+    # 遍历所有行取并集，确保收集到所有列分隔线。
     col_xs = set()
-    for cell in rows[0].cells:
-        if cell:
-            col_xs.add(round(cell[0]))
-            col_xs.add(round(cell[2]))
+    for row in rows:
+        for cell in row.cells:
+            if cell:
+                col_xs.add(round(cell[0]))
+                col_xs.add(round(cell[2]))
     col_xs = sorted(col_xs)
     n_cols = len(col_xs) - 1 if len(col_xs) >= 2 else 1
+    # 交叉验证：PyMuPDF 的 col_count 是内部精确计算的最可靠列数
+    if pymupdf_table.col_count and pymupdf_table.col_count > n_cols:
+        n_cols = pymupdf_table.col_count
     if n_cols < 1:
         return None
 
@@ -1245,19 +1252,24 @@ def _infer_colspan_rowspan(pymupdf_table) -> list[list[dict[str, Any]]] | None:
         for ci in range(n_cols):
             if ci < len(pm_cells) and pm_cells[ci] is not None:
                 cell_bbox = pm_cells[ci]
-                # 计算这个 cell 跨了多少行
                 cx0, cy0, cx1, cy1 = cell_bbox
-                rowspan = 0
-                for ry in row_ys:
-                    if cy0 - 1 <= ry <= cy1 + 1:
-                        rowspan += 1
-                rowspan = max(1, rowspan)
-                # 计算跨了多少列
-                colspan = 0
-                for cx in col_xs[:-1]:
-                    if cx0 - 1 <= cx <= cx1 + 1:
-                        colspan += 1
-                colspan = max(1, colspan)
+                # 计算 rowspan/colspan：用边界点索引差值。
+                # cell 的左/右边界对齐 col_xs 的某个点，上/下边界对齐 row_ys 的某个点，
+                # colspan = 右边界索引 - 左边界索引，rowspan = 下边界索引 - 上边界索引。
+                # ⚠️ 不能用"覆盖了多少个边界点"（会多算1：cell 两端本身是边界点）。
+                def _span_of(val0, val1, ticks, tol=1):
+                    """val0/val1 在 ticks 中的索引差 = 跨度"""
+                    i = j = None
+                    for idx, t in enumerate(ticks):
+                        if abs(t - val0) <= tol:
+                            i = idx
+                        if abs(t - val1) <= tol:
+                            j = idx
+                    if i is not None and j is not None:
+                        return max(1, j - i)
+                    return 1
+                rowspan = _span_of(cy0, cy1, row_ys)
+                colspan = _span_of(cx0, cx1, col_xs)
                 row_data.append({"text": "", "rowspan": rowspan, "colspan": colspan})
             else:
                 # 被合并的位置
@@ -1630,6 +1642,12 @@ def _fill_table_cells(table, rows: list[list[dict[str, Any]]],
             rowspan = cell_data.get("rowspan", 1)
             colspan = cell_data.get("colspan", 1)
             text = cell_data.get("text", "")
+
+            # rowspan=0/colspan=0 是被合并占位的格子，跳过（不做任何操作）
+            # 这些位置的 occupied 标记已由前驱 cell 的 colspan/rowspan 设置
+            if rowspan == 0 or colspan == 0:
+                c_idx += 1
+                continue
 
             try:
                 target_cell = table.cell(r_idx, c_idx)
@@ -2203,6 +2221,9 @@ def build_docx(
                     }
                     if cell_texts:
                         new_block["_pymupdf_cells"] = cell_texts
+                        # 保存 Table 对象供 _build_table_from_pymupdf 推断合并单元格。
+                        # 该字段不序列化到 JSON（运行时内存传递），仅在本次 build 有效。
+                        new_block["_pymupdf_table"] = pm_t
                     if widths:
                         new_block["_col_widths"] = widths
                     if row_heights:
