@@ -1335,6 +1335,14 @@ def _build_table_from_pymupdf(
     row_heights = block.get("_table_row_heights")
     if row_heights and len(row_heights) == n_rows:
         _set_table_row_heights(table, row_heights, rule="atLeast")
+    elif not row_heights:
+        # 行高兜底：用 block bbox 高度 ÷ 行数（同 HTML 路径的兜底逻辑）
+        bbox = block.get("bbox") or []
+        if len(bbox) >= 4 and n_rows > 0:
+            block_h = bbox[3] - bbox[1]
+            if block_h > 20:
+                avg_h = block_h / n_rows
+                _set_table_row_heights(table, [avg_h] * n_rows, rule="atLeast")
 
     _fill_table_cells(table, rows_data, block.get("_style"), table_lh,
                       row_line_heights, cell_styles)
@@ -1419,6 +1427,17 @@ def _build_table(doc, block: dict[str, Any]) -> None:
     row_heights = block.get("_table_row_heights")
     if row_heights and len(row_heights) == len(table.rows):
         _set_table_row_heights(table, row_heights, rule="atLeast")
+    elif not row_heights:
+        # 行高兜底：PyMuPDF 检测不到的表格（如线条画的空方框/身份证粘贴区）
+        # 没有预扫描行高数据，用 block bbox 高度 ÷ 行数 推断。
+        # bbox 高度是 MinerU 正确测量的（如83pt方框），可靠。
+        bbox = block.get("bbox") or []
+        n_rows_tbl = len(table.rows)
+        if len(bbox) >= 4 and n_rows_tbl > 0:
+            block_h = bbox[3] - bbox[1]
+            if block_h > 20:  # 避免极小值
+                avg_h = block_h / n_rows_tbl
+                _set_table_row_heights(table, [avg_h] * n_rows_tbl, rule="atLeast")
 
     _fill_table_cells(table, rows, block.get("_style"), table_lh, row_line_heights,
                       block.get("_table_cell_styles"))

@@ -192,6 +192,19 @@ atLeast 允许行高自适应增长，避免底部内容被裁剪。
 - 用文档中位数作为表格行距（与正文行距混淆）
 - `exact` 模式（字体宽度差异导致实际行数多于预期时裁剪底部内容）
 
+**行高兜底**（PyMuPDF 检测不到的表格）：
+当 PyMuPDF `find_tables()` 检测不到表格（如线条画的空方框/身份证复印件粘贴区），
+`_table_row_heights` 为 None → trHeight 不设 → 行高=默认单行文字高度。
+此时用 **block bbox 高度 ÷ 行数** 兜底（bbox 高度是 MinerU 正确测量的，如 83pt 方框）：
+```python
+if not row_heights:
+    block_h = bbox[3] - bbox[1]
+    avg_h = block_h / n_rows
+    _set_table_row_heights(table, [avg_h] * n_rows, rule="atLeast")
+```
+在 `_build_table`（HTML 路径）和 `_build_table_from_pymupdf`（PyMuPDF 路径）中均实现。
+**验证**：PDF 第68页授权委托书的两个身份证方框从"单行高度"恢复为 83/85pt。
+
 ### 规则 9：跨页表格数据合并——首页主 block 收集全部 PyMuPDF 数据
 
 MinerU 把跨页表格的全部行放在第一个 table block 的 HTML 中，
