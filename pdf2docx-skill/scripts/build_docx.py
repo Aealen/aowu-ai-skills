@@ -796,6 +796,112 @@ def _measure_block_line_height(
     return round(block_h / n_lines, 1)
 
 
+def _split_crosspage_blocks(pdf_info: list) -> int:
+    """
+    拆分跨页 text block：按 PDF 页边界切成"本页部分"+"续页部分"。
+
+    MinerU 把跨页段落的全部行（含下一页续行）塞进同一个 block 的 lines 数组，
+    但 block 的 bbox 只覆盖本页部分。本函数把它拆成两个独立 block，
+    使每个 block 的 bbox 准确覆盖自己的行，从而 bbox高/行数 能算出正确行高；
+    配合主循环的分页符实现 PDF 分页复刻。
+
+    数据流：
+      1. 检测跨页 block（lines y 跨度 > bbox 高 × 1.5）
+      2. 本页行 = y0 落在 bbox 范围内（容差 5pt）的 line
+         续页行 = 其余 line（y0 是下一页坐标，突然变小≈80）
+      3. 原 block 只保留本页行（lines 截断）
+      4. 下一页的空占位 block#0（lines_deleted:true, lines:[]）
+         被替换为续页 block：塞入续页行，继承占位 block 的 bbox（已精确覆盖续行区域），
+         标记 _crosspage_continuation=True（主循环据此插分页符）
+
+    返回拆分的 block 数量（用于日志）。
+    """
+    split_count = 0
+    for pi, page in enumerate(pdf_info):
+        if not isinstance(page, dict):
+            continue
+        blocks = page.get("para_blocks") or page.get("blocks") or []
+        for bi, block in enumerate(blocks):
+            btype = (block.get("type") or block.get("block_type") or "").lower()
+            if btype not in ("text", "paragraph", "list"):
+                continue  # 只拆文本类 block
+            bbox = block.get("bbox") or []
+            lines = block.get("lines") or []
+            if not bbox or len(bbox) < 4 or not lines:
+                continue
+
+            # 收集所有 line 的 y 坐标
+            line_ys = []
+            for ln in lines:
+                lbbox = ln.get("bbox")
+                if lbbox and len(lbbox) >= 4:
+                    line_ys.append((lbbox[1], lbbox[3]))
+            if not line_ys:
+                continue
+
+            # 跨页检测（判据：lines y 跨度 > bbox 高 × 1.5）
+            # 正常 block：lines_span ≈ block_h；跨页 block：lines_span ≈ 满页高（≈660pt）
+            block_h = bbox[3] - bbox[1]
+            if block_h <= 0:
+                continue
+            lines_span = max(y1 for _, y1 in line_ys) - min(y0 for y0, _ in line_ys)
+            if lines_span <= block_h * 1.5:
+                continue  # 非跨页，跳过
+
+            # 跨页 block：按 y0 分本页行 / 续页行
+            on_page_lines = [ln for ln in lines
+                             if ln.get("bbox") and len(ln["bbox"]) >= 4
+                             and ln["bbox"][1] >= bbox[1] - 5]
+            cont_lines = [ln for ln in lines if ln not in on_page_lines]
+            if not on_page_lines or not cont_lines:
+                continue  # 无法拆分，跳过
+
+            # 1. 原 block 只保留本页行
+            block["lines"] = on_page_lines
+
+            # 2. 找下一页的空占位 block#0，替换为续页 block
+            next_page = pdf_info[pi + 1] if pi + 1 < len(pdf_info) else None
+            if not isinstance(next_page, dict):
+                continue
+            next_blocks = next_page.get("para_blocks") or next_page.get("blocks") or []
+
+            # 空占位特征：type=text/paragraph, lines=[], lines_deleted=true
+            placeholder = None
+            if next_blocks:
+                ph = next_blocks[0]
+                ph_type = (ph.get("type") or ph.get("block_type") or "").lower()
+                ph_lines = ph.get("lines") or []
+                if (ph_type in ("text", "paragraph")
+                        and len(ph_lines) == 0
+                        and ph.get("lines_deleted")):
+                    placeholder = ph
+
+            if placeholder:
+                # 用续页行填充占位 block（bbox 已精确覆盖续行区域，保留）
+                placeholder["lines"] = cont_lines
+                placeholder["type"] = block.get("type") or "text"
+                if "block_type" in placeholder:
+                    placeholder["block_type"] = block.get("block_type") or "text"
+                placeholder["_crosspage_continuation"] = True
+            else:
+                # 无占位 block 的兜底：在下一页 blocks 开头插入续页 block
+                cont_bbox = list(bbox)  # 回退用原 bbox
+                cont_block = {
+                    "type": block.get("type") or "text",
+                    "bbox": cont_bbox,
+                    "lines": cont_lines,
+                    "_crosspage_continuation": True,
+                }
+                if next_page.get("para_blocks") is not None:
+                    next_page["para_blocks"].insert(0, cont_block)
+                if next_page.get("blocks") is not None:
+                    next_page["blocks"].insert(0, cont_block)
+
+            split_count += 1
+
+    return split_count
+
+
 def _match_blocks_with_toc(fitz_doc, pdf_info: list) -> int:
     """
     用 PDF 大纲（书签/TOC）确定哪些 block 是真正的标题。
@@ -1912,6 +2018,15 @@ def build_docx(
             if not sec.bottom_margin:
                 sec.bottom_margin = Pt(72)
 
+    # ── 跨页 block 拆分：按 PDF 页边界切开，复刻 PDF 分页 ──
+    # MinerU 把跨页段落塞进一个 block，bbox 只覆盖本页。
+    # 拆成本页部分 + 续页部分（替换下一页空占位），配合分页符实现分页复刻。
+    # ⚠️ 必须在行高提取之前执行：拆分后各部分 lines 数正确，bbox高/行数 才能算准。
+    split_count = _split_crosspage_blocks(pdf_info)
+    if split_count:
+        print(f"  📄 拆分 {split_count} 个跨页 block（本页+续页分离，插分页符）",
+              file=sys.stderr)
+
     # ── 预扫描：从 PDF 提取排版信息（行高、列宽、单元格换行）──
     # 对所有 block 类型提取真实行高（block["_line_height"]），
     # 使后续不同 PDF 都能各自还原真实行距，而非用统一默认值。
@@ -2187,6 +2302,11 @@ def build_docx(
                 _add_page_break(doc)
 
         for block in blocks:
+            # 跨页续行 block：先插分页符，强制翻页到下一页（复刻 PDF 分页）
+            if block.get("_crosspage_continuation"):
+                _add_page_break(doc)
+                prev_block_bottom = None  # 翻页后重置 Y 追踪
+
             # 根据与上一个 block 的 Y 坐标差插入垂直留白
             bbox = block.get("bbox", [])
             if bbox and len(bbox) >= 4:

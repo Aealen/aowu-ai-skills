@@ -285,7 +285,36 @@ def align_and_merge(
         for block in blocks:
             # 精细匹配：block 有 lines.spans 结构
             if block.get("lines"):
-                _attach_styles_to_block(block, page_spans, iou_threshold, stats)
+                # 跨页 block 检测（规则19）：
+                # MinerU 把跨页段落的续行（坐标在下一页）也收进同一个 block 的 lines，
+                # 但 block 所在页的 spans 里没有这些续行坐标 → IoU=0 匹配不上（无 _style）
+                # 或 containment 误匹配到本页错误 span（字体串扰，如 SimHei 15.9pt）。
+                # 检测判据：lines 的 y 跨度 > block bbox 高度 × 1.5
+                #   正常 block：lines_span ≈ block_h
+                #   跨页 block：续行 y0 是下一页坐标，lines_span ≈ 满页高（≈660pt）
+                bbox = block.get("bbox") or []
+                lines = block.get("lines") or []
+                is_crosspage = False
+                if bbox and len(bbox) >= 4 and lines:
+                    block_h = bbox[3] - bbox[1]
+                    if block_h > 0:
+                        line_bboxes = [ln["bbox"] for ln in lines
+                                       if ln.get("bbox") and len(ln["bbox"]) >= 4]
+                        if line_bboxes:
+                            lines_span = (max(b[3] for b in line_bboxes)
+                                          - min(b[1] for b in line_bboxes))
+                            is_crosspage = lines_span > block_h * 1.5
+
+                if is_crosspage:
+                    # 跨页：合并相邻页（page±1）的 spans，让续行 span 能匹配到正确页
+                    # IoU 坐标唯一性保障：续行 bbox 只会与同坐标的 span 高 IoU，
+                    # 不会因合并多页而误匹配（不同页同坐标的 span 极罕见，仅页眉页脚）
+                    nearby_spans: list[dict[str, Any]] = []
+                    for delta in (-1, 0, 1):
+                        nearby_spans.extend(spans_by_page.get(page_idx + delta, []))
+                    _attach_styles_to_block(block, nearby_spans, iou_threshold, stats)
+                else:
+                    _attach_styles_to_block(block, page_spans, iou_threshold, stats)
             # 兜底：block 无 lines 结构（title/image/table 等），
             # 用 block 整体 bbox 找占比最大样式
             else:
