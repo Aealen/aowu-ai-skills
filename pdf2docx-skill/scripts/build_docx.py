@@ -2300,6 +2300,38 @@ def build_docx(
             first_btype = (blocks[0].get("type") or blocks[0].get("block_type") or "").lower()
             if first_btype == "title":
                 _add_page_break(doc)
+            elif first_btype in ("text", "paragraph"):
+                # 非标题的强分页检测：PDF 中上页正文没写满就翻页，
+                # 且本页 block#0 在页首 → PDF 有强制分页意图（如"响应文件封面"参考格式页）。
+                # 判据（全部满足）：
+                #   1. 本页 block#0 在页首（y0 < 页高 14%）
+                #   2. 上一页最后一个有内容的 block 也是 text/paragraph（排除表格续页干扰）
+                #   3. 上页最后 block 的 y1 明显低于正常页底（< 页高 60%）
+                #      正常正文页 y1≈700-760，强分页页 y1≈280（只写1/3页）
+                f0_bbox = blocks[0].get("bbox") or []
+                f0_y0 = f0_bbox[1] if len(f0_bbox) >= 4 else page_height
+                if f0_y0 < page_height * 0.14:
+                    # 找上一页最后一个有内容的 block
+                    prev_page = pdf_info[page_idx - 1] if page_idx > 0 else None
+                    if isinstance(prev_page, dict):
+                        prev_blocks = (prev_page.get("para_blocks")
+                                       or prev_page.get("blocks") or [])
+                        for pb in reversed(prev_blocks):
+                            pb_lines = pb.get("lines") or []
+                            pb_txt = "".join(
+                                s.get("content", "")
+                                for ln in pb_lines for s in ln.get("spans", [])
+                            )
+                            if pb_txt.strip():
+                                pb_type = (pb.get("type")
+                                           or pb.get("block_type") or "").lower()
+                                pb_bbox = pb.get("bbox") or []
+                                pb_y1 = pb_bbox[3] if len(pb_bbox) >= 4 else page_height
+                                if (pb_type in ("text", "paragraph")
+                                        and pb_y1 < page_height * 0.60):
+                                    _add_page_break(doc)
+                                break  # 只看最后一个有内容的 block
+
 
         for block in blocks:
             # 跨页续行 block：先插分页符，强制翻页到下一页（复刻 PDF 分页）
