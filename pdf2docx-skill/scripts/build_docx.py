@@ -1289,14 +1289,12 @@ def _infer_colspan_rowspan(pymupdf_table) -> list[list[dict[str, Any]]] | None:
 
 def _build_table_from_pymupdf(
     doc, block: dict[str, Any], pymupdf_cells: list[list[str]],
-    pymupdf_table=None,
 ) -> None:
     """
     从 PyMuPDF 表格数据直接构建 DOCX 表格。
 
     pymupdf_cells: PyMuPDF extract() 返回的 cell 文本矩阵 [row][col]
-    pymupdf_table: PyMuPDF Table 对象（可选），用于推断 colspan/rowspan。
-      传入时从 cell 物理边界推断合并单元格；不传时所有 cell 默认无合并。
+    colspan/rowspan 推断结果从 block["_table_merged_cells"] 读取（预扫描时已计算）。
     """
     n_rows = len(pymupdf_cells)
     n_cols = max((len(row) for row in pymupdf_cells), default=1)
@@ -1316,8 +1314,10 @@ def _build_table_from_pymupdf(
     table_lh = block.get("_table_line_height") or block.get("_doc_line_height")
     row_line_heights = block.get("_table_row_line_heights")
 
-    # 构建 rows_data：优先用 cell 边界推断 colspan/rowspan
-    inferred = _infer_colspan_rowspan(pymupdf_table) if pymupdf_table else None
+    # 构建 rows_data：用预扫描时计算的 colspan/rowspan 推断结果
+    # （PyMuPDF Table 对象存在状态共享 bug，不能保存引用后再调用 extract()，
+    # 必须在获取 mtable 的瞬间立即计算 _infer_colspan_rowspan 并存储结果）
+    inferred = block.get("_table_merged_cells")
     if inferred and len(inferred) == n_rows:
         rows_data = inferred
     else:
@@ -1397,8 +1397,7 @@ def _build_table(doc, block: dict[str, Any]) -> None:
 
     # 默认：PyMuPDF 重建路径（简单表格，文字更准确）
     if pymupdf_cells:
-        pm_table = block.get("_pymupdf_table")
-        _build_table_from_pymupdf(doc, block, pymupdf_cells, pymupdf_table=pm_table)
+        _build_table_from_pymupdf(doc, block, pymupdf_cells)
         return
 
     # 回退：无 PyMuPDF 数据时用 MinerU HTML
@@ -2110,7 +2109,10 @@ def build_docx(
                         cell_texts = _extract_table_cell_texts(mtable)
                         if cell_texts:
                             block["_pymupdf_cells"] = cell_texts
-                            block["_pymupdf_table"] = mtable  # 保存对象用于推断合并单元格
+                            # 立即推断 colspan/rowspan（PyMuPDF Table 对象存在状态共享 bug，
+                            # 对其他页的 Table 调用任何操作会污染本页 Table 的 extract() 结果，
+                            # 所以必须在获取 mtable 的瞬间立即计算，不存 Table 引用）
+                            block["_table_merged_cells"] = _infer_colspan_rowspan(mtable)
                             texts_found += 1
                         cell_styles = _extract_table_cell_styles(mtable, fitz_page)
                         if cell_styles:
@@ -2240,9 +2242,8 @@ def build_docx(
                     }
                     if cell_texts:
                         new_block["_pymupdf_cells"] = cell_texts
-                        # 保存 Table 对象供 _build_table_from_pymupdf 推断合并单元格。
-                        # 该字段不序列化到 JSON（运行时内存传递），仅在本次 build 有效。
-                        new_block["_pymupdf_table"] = pm_t
+                        # 立即推断 colspan/rowspan（同预扫描逻辑，不存 Table 引用）
+                        new_block["_table_merged_cells"] = _infer_colspan_rowspan(pm_t)
                     if widths:
                         new_block["_col_widths"] = widths
                     if row_heights:
