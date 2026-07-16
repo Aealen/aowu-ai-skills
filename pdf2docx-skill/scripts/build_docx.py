@@ -317,6 +317,9 @@ def _apply_style(run, style: dict[str, Any] | None = None) -> None:
     if style.get("italic"):
         run.font.italic = True
 
+    if style.get("underline"):
+        run.font.underline = True
+
     color = style.get("color")
     if color is not None:
         # sRGB 整数 → RGBColor
@@ -1724,6 +1727,7 @@ def _fill_table_cells(table, rows: list[list[dict[str, Any]]],
                             "bold": sp.get("bold"),
                             "italic": sp.get("italic"),
                             "color": sp.get("color"),
+                            "underline": sp.get("underline", False),
                         }
                         run = para.add_run(sp_text)
                         _apply_style(run, sp_style)

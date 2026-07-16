@@ -129,17 +129,21 @@ def cmd_convert(args) -> None:
     )
 
     # ── Step 2: PyMuPDF 样式提取 ──
-    from parse_pymupdf import extract_spans, save_spans
+    from parse_pymupdf import extract_spans, save_spans, extract_underline_lines
     spans = extract_spans(str(pdf_path))
     spans_path = save_spans(spans, work_dir / "_spans.json")
-    print(f"[2/4] PyMuPDF 样式提取: {len(spans)} 个 span → {spans_path}",
+    # B 类下划线提取（填空区域空白下划线，A 类已在 extract_spans 中标注到 span）
+    underline_lines = extract_underline_lines(str(pdf_path), spans)
+    print(f"[2/4] PyMuPDF 样式提取: {len(spans)} 个 span, "
+          f"{len(underline_lines)} 条填空下划线 → {spans_path}",
           file=sys.stderr)
 
     # ── Step 3: bbox 对齐合并 ──
     from align import align_and_merge, load_mineru, save_merged
     mineru_data = load_mineru(middle_path)
     merged_data, stats = align_and_merge(
-        mineru_data, spans, iou_threshold=args.iou
+        mineru_data, spans, iou_threshold=args.iou,
+        underline_lines=underline_lines,
     )
     merged_path = save_merged(merged_data, work_dir / "_merged.json")
 

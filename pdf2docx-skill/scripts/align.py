@@ -192,6 +192,7 @@ def _attach_styles_to_block(
                     "bold": best["bold"],
                     "italic": best["italic"],
                     "color": best["color"],
+                    "underline": best.get("underline", False),
                 }
                 stats["matched"] += 1
             else:
@@ -235,6 +236,7 @@ def _attach_style_to_block_fallback(
                 "bold": s["bold"],
                 "italic": s["italic"],
                 "color": s["color"],
+                "underline": s.get("underline", False),
             }
             break
 
@@ -243,11 +245,103 @@ def _attach_style_to_block_fallback(
 #  对外主接口
 # ═══════════════════════════════════════════════════════════════
 
+
+def _inject_underline_spans(
+    mineru_data: dict[str, Any],
+    underline_lines: list[dict[str, Any]],
+) -> int:
+    """
+    把 B 类下划线（填空区域空白下划线）作为虚拟 span 注入 MinerU 数据。
+
+    每条下划线查找它所在的 MinerU block 和 line，创建一个带下划线样式的
+    空格 span，按 x 坐标插入到 line.spans 的正确位置。
+
+    返回注入的 span 数量。
+    """
+    if not underline_lines:
+        return 0
+
+    page_blocks = collect_page_blocks(mineru_data)
+    injected = 0
+
+    for ul in underline_lines:
+        page_idx = ul["page_idx"]
+        ul_x0, ul_y, ul_x1 = ul["x0"], ul["y"], ul["x1"]
+        blocks = page_blocks.get(page_idx, [])
+
+        # 找包含此下划线的 block（bbox 覆盖线条位置）
+        target_block = None
+        for b in blocks:
+            bbox = b.get("bbox") or []
+            if len(bbox) < 4:
+                continue
+            # 线条中心在 block bbox 内
+            cx = (ul_x0 + ul_x1) / 2
+            if bbox[0] - 5 <= cx <= bbox[2] + 5 and bbox[1] - 10 <= ul_y <= bbox[3] + 10:
+                target_block = b
+                break
+
+        if not target_block or not target_block.get("lines"):
+            continue
+
+        # 找包含此下划线的 line（line bbox 的 y 范围包含线条 y）
+        target_line = None
+        for ln in target_block.get("lines", []):
+            lbbox = ln.get("bbox") or []
+            if len(lbbox) < 4:
+                continue
+            # 线条 y 在 line 的 y 范围内（容差 10pt，因为下划线可能在行底部稍下方）
+            if lbbox[1] - 10 <= ul_y <= lbbox[3] + 5:
+                target_line = ln
+                break
+
+        if not target_line:
+            continue
+
+        # 创建虚拟 span：空格填充下划线长度
+        # 每字符约12pt（FangSong 12pt 全角空格宽度），估算空格数
+        line_width = ul_x1 - ul_x0
+        n_spaces = max(1, round(line_width / 11))
+
+        # 获取同 line 主导样式（首个有 _style 的 span）
+        dominant_style = None
+        for sp in target_line.get("spans", []):
+            st = sp.get("_style")
+            if st and st.get("font"):
+                dominant_style = dict(st)
+                break
+        if not dominant_style:
+            dominant_style = {"font": "FangSong", "size": 12.0, "bold": False,
+                              "italic": False, "color": 0}
+        dominant_style["underline"] = True
+
+        virtual_span = {
+            "bbox": [ul_x0, ul_y - 2, ul_x1, ul_y + 2],
+            "content": " " * n_spaces,
+            "type": "text",
+            "_style": dominant_style,
+        }
+
+        # 按 x 坐标插入到 spans 正确位置
+        spans_list = target_line.setdefault("spans", [])
+        insert_idx = len(spans_list)
+        for i, sp in enumerate(spans_list):
+            sp_x0 = (sp.get("bbox") or [0])[0]
+            if ul_x0 < sp_x0:
+                insert_idx = i
+                break
+        spans_list.insert(insert_idx, virtual_span)
+        injected += 1
+
+    return injected
+
+
 def align_and_merge(
     mineru_data: dict[str, Any],
     spans: list[dict[str, Any]],
     *,
     iou_threshold: float = DEFAULT_IOU_THRESHOLD,
+    underline_lines: list[dict[str, Any]] | None = None,
 ) -> tuple[dict[str, Any], dict[str, int]]:
     """
     将 PyMuPDF 的 span 样式对齐贴回 MinerU 的 block。
@@ -319,6 +413,11 @@ def align_and_merge(
             # 用 block 整体 bbox 找占比最大样式
             else:
                 _attach_style_to_block_fallback(block, page_spans)
+
+    # B 类下划线注入：在样式贴完后，把填空区域的空白下划线作为虚拟 span 插入
+    if underline_lines:
+        injected = _inject_underline_spans(mineru_data, underline_lines)
+        stats["underline_injected"] = injected
 
     return mineru_data, stats
 

@@ -269,6 +269,102 @@ def _apply_document_density_baseline(all_spans: list[dict]) -> None:
 
 # ═══════════════════════════════════════════════════════════════
 
+def _extract_horizontal_lines(page) -> list[dict[str, float]]:
+    """
+    从 PyMuPDF 页面的绘图对象中提取水平线（可能是下划线或表格边框）。
+
+    返回 [{"x0", "y", "x1", "width"}]，y 为线的 y 坐标，x0<x1。
+    过滤条件：水平（y差<1pt）、长度 5~200pt。
+    """
+    lines = []
+    try:
+        for dr in page.get_drawings():
+            for item in dr.get("items", []):
+                if item[0] != "l":  # 只看 line segment
+                    continue
+                p1, p2 = item[1], item[2]
+                if abs(p1.y - p2.y) > 1:  # 非水平
+                    continue
+                x0, x1 = min(p1.x, p2.x), max(p1.x, p2.x)
+                length = x1 - x0
+                if length < 5 or length > 200:  # 太短或太长（表格边框）
+                    continue
+                y = (p1.y + p2.y) / 2
+                lines.append({"x0": x0, "y": y, "x1": x1})
+    except Exception:
+        pass
+    return lines
+
+
+def extract_underline_lines(
+    pdf_path: str | Path,
+    spans: list[dict[str, Any]] | None = None,
+    *,
+    start_page: int = 0,
+    end_page: int = None,
+) -> list[dict[str, Any]]:
+    """
+    提取 PDF 中的 B 类下划线（填空区域空白下划线，上方无文字）。
+
+    与 extract_spans 中的 A 类检测互补：
+    - A 类：线条匹配到 span → span.underline=True（在 extract_spans 中处理）
+    - B 类：线条未匹配到任何 span → 返回此处，供 align.py 插入虚拟 span
+
+    参数：
+        spans: extract_spans 的输出（可选，传入时用于排除 A 类已匹配的线条）
+    返回：
+        [{"page_idx", "x0", "y", "x1", "length"}]
+    """
+    try:
+        import fitz
+    except ImportError:
+        return []
+
+    # 按页分组 spans（用于排除 A 类）
+    spans_by_page: dict[int, list[dict]] = {}
+    if spans:
+        for s in spans:
+            spans_by_page.setdefault(s["page_idx"], []).append(s)
+
+    doc = fitz.open(str(pdf_path))
+    result = []
+    total = doc.page_count
+    if end_page is None:
+        end_page = total
+    end_page = min(end_page, total)
+
+    for page_idx in range(start_page, end_page):
+        page = doc[page_idx]
+        h_lines = _extract_horizontal_lines(page)
+        page_spans = spans_by_page.get(page_idx, [])
+
+        for hl in h_lines:
+            # 检查是否匹配到某个 span（A 类）—— 匹配条件同 extract_spans
+            is_a_type = False
+            for sp in page_spans:
+                sy1 = sp["bbox"][3]
+                y_diff = hl["y"] - sy1
+                if y_diff < -2 or y_diff > 1:
+                    continue
+                sx0, sx1 = sp["bbox"][0], sp["bbox"][2]
+                overlap = min(hl["x1"], sx1) - max(hl["x0"], sx0)
+                span_w = sx1 - sx0
+                if span_w > 0 and overlap / span_w > 0.5:
+                    is_a_type = True
+                    break
+            if not is_a_type:
+                result.append({
+                    "page_idx": page_idx,
+                    "x0": hl["x0"],
+                    "y": hl["y"],
+                    "x1": hl["x1"],
+                    "length": hl["x1"] - hl["x0"],
+                })
+
+    doc.close()
+    return result
+
+
 def extract_spans(
     pdf_path: str | Path,
     *,
@@ -367,7 +463,32 @@ def extract_spans(
                         "flags": flags,
                         "bold": _is_bold(flags, font_name, linewidth),
                         "italic": bool(flags & (1 << 1)),   # bit1(2)=斜体
+                        "underline": False,  # 下划线（从绘图线条检测，见下方）
                     })
+
+        # 下划线检测：从绘图线条提取水平线，匹配到 span 底部（A类）
+        # PDF 下划线是独立水平线条，不在 span flags 里。
+        # 几何特征：线 y ≈ span.y1 - 0.5pt（几乎重合），x 重叠 >50%
+        try:
+            h_lines = _extract_horizontal_lines(page)
+            for hl in h_lines:
+                matched = False
+                for sp in page_spans:
+                    sy1 = sp["bbox"][3]
+                    y_diff = hl["y"] - sy1
+                    # 线在 span 底部下方 -2~+1pt（实测约-0.5pt）
+                    if y_diff < -2 or y_diff > 1:
+                        continue
+                    # x 重叠 >50% of span width
+                    sx0, sx1 = sp["bbox"][0], sp["bbox"][2]
+                    overlap = min(hl["x1"], sx1) - max(hl["x0"], sx0)
+                    span_w = sx1 - sx0
+                    if span_w > 0 and overlap / span_w > 0.5:
+                        sp["underline"] = True
+                        matched = True
+                        break
+        except Exception:
+            pass  # 下划线检测失败不影响整体
 
         # CID 字体像素密度测量（仅测量，不判断——判断需要文档级基线）
         if page_spans:
