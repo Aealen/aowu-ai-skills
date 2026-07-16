@@ -1673,16 +1673,21 @@ def _fill_table_cells(table, rows: list[list[dict[str, Any]]],
             try:
                 target_cell = table.cell(r_idx, c_idx)
                 target_cell.text = ""  # 清空
-                # 设置 cell 四边内边距为 0：
-                # 上下清零消除 exact 模式下内容被裁剪；
-                # 左右清零使可用文字宽度 = cell 全宽（与 PDF 一致），
-                # 避免默认 5.4pt×2 内边距吃掉宽度导致末尾字被裁剪。
+                # 设置 cell 内边距：
+                # 上下清零（消除 exact 模式下内容被裁剪）；
+                # 左右设 28 twips(1.4pt) 而非 0——全0时 WPS 会把文字紧贴
+                # cell 边缘导致末尾字溢出，留微小内边距更安全。
                 from docx.oxml import OxmlElement as _OxmlEl
                 tcPr = target_cell._tc.get_or_add_tcPr()
                 tcMar = _OxmlEl('w:tcMar')
-                for side in ('top', 'bottom', 'left', 'right'):
+                for side in ('top', 'bottom'):
                     m = _OxmlEl(f'w:{side}')
                     m.set(_qn('w:w'), '0')
+                    m.set(_qn('w:type'), 'dxa')
+                    tcMar.append(m)
+                for side in ('left', 'right'):
+                    m = _OxmlEl(f'w:{side}')
+                    m.set(_qn('w:w'), '28')  # 1.4pt
                     m.set(_qn('w:type'), 'dxa')
                     tcMar.append(m)
                 tcPr.append(tcMar)

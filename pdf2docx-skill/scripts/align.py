@@ -317,7 +317,9 @@ def _inject_underline_spans(
 
         virtual_span = {
             "bbox": [ul_x0, ul_y - 2, ul_x1, ul_y + 2],
-            "content": " " * n_spaces,
+            # 用全角空格(U+3000)而非半角空格——WPS 对半角空格的下划线
+            # 可能不渲染，全角空格更可靠地显示下划线填空区域
+            "content": "\u3000" * n_spaces,
             "type": "text",
             "_style": dominant_style,
         }
