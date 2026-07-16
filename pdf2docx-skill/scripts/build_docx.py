@@ -731,8 +731,10 @@ def _extract_table_row_geometry(
                     lx0 = line["bbox"][0]
                     if (ry0 - 3 <= ly0 <= ry1 + 3 and
                             cx0 - 3 <= lx0 <= cx1 + 3):
-                        y0s.append(ly0)
-            y0s.sort()
+                        y0s.append(round(ly0, 1))
+            # 去重：同一行内多个 span（如"年""月""日"各自独立）有相同 y0，
+            # 应归为同一行，不能重复计数（否则 max_text_lines 虚高→行距偏小）
+            y0s = sorted(set(y0s))
             col_y0s[ci] = y0s
 
         # 该行的最大文字行数（取所有列中行数最多的）
@@ -1336,7 +1338,11 @@ def _build_table_from_pymupdf(
     # 但 DOCX 渲染时系统字体宽度不同（即使同名），实际行数可能多于 break 数。
     # exact 模式会裁剪多出的行；atLeast 允许行高自适应。
     row_heights = block.get("_table_row_heights")
+    # 回归检测补偿：_auto_align_tables 迭代时给表格行高叠加的微调值
+    comp = block.get("_row_height_compensation", 0)
     if row_heights and len(row_heights) == n_rows:
+        if comp:
+            row_heights = [h + comp for h in row_heights]
         _set_table_row_heights(table, row_heights, rule="atLeast")
     elif not row_heights:
         # 行高兜底：用 block bbox 高度 ÷ 行数（同 HTML 路径的兜底逻辑）
@@ -2129,15 +2135,29 @@ def build_docx(
                         # 行高和 cell 内文字行高（从 PDF 原始数据提取）
                         row_heights, text_lh, row_lhs = _extract_table_row_geometry(mtable, fitz_page)
                         if row_heights:
+                            # 防溢出：若 table 行高总和接近页面高度，WPS 渲染时
+                            # 表格边框+内边距+分页符段落会超出可用空间，导致最后一行
+                            # 被挤到下一页单独显示。检测到接近页满时，等比压缩行高。
+                            # 阈值：总高 > 页高 × 0.80（A4 约 673pt），预留 20% 给边距+渲染开销。
+                            total_h = sum(row_heights)
+                            page_h = fitz_page.rect.height
+                            max_table_h = page_h * 0.80
+                            if total_h > max_table_h:
+                                scale = max_table_h / total_h
+                                row_heights = [round(h * scale, 1) for h in row_heights]
+                                # cell 内行距同步压缩，保持行高与行距比例一致
+                                row_lhs = [round(lh * scale, 1) if lh else None
+                                           for lh in row_lhs]
                             block["_table_row_heights"] = row_heights
                             block["_table_row_line_heights"] = row_lhs
                         if text_lh:
                             block["_table_line_height"] = text_lh
 
-            # ── 跨页表格数据合并 ──
-            # MinerU 把跨页表格的全部行放在第一个 table block 的 HTML 中，
-            # 但 PyMuPDF 表格数据（每行高度、cell 文本含换行）分散在各页。
-            # 收集后续续页的 PyMuPDF 数据，合并到第一个 block。
+            # ── 跨页表格数据分发（替代旧的合并逻辑）──
+            # MinerU 把跨页表格的全部行放在主 block（page_idx=N）的 HTML 中，
+            # 续页 block（page_idx=N+1...）是空占位（lines_deleted, 无HTML）。
+            # 旧逻辑把续页数据合并到主block → 33行连续表格 → DOCX自行分页（不可控偏移）。
+            # 新逻辑：主block只保留本页行数，每个续页block独立填充 → 每页独立表格+分页符。
             for pi, page in enumerate(pdf_info):
                 page_idx = page.get("page_idx", 0)
                 if page_idx >= fdoc.page_count:
@@ -2149,14 +2169,19 @@ def build_docx(
                         continue
                     html = _extract_table_html(block)
                     if not html:
-                        continue  # 续页 block 无 HTML，跳过（数据将在下面被前驱合并）
-                    # 此 block 有 HTML → 它是跨页表格的主 block
-                    # 向后查找续页的 table block，合并 PyMuPDF 数据
-                    merged_cells = list(block.get("_pymupdf_cells") or [])
-                    merged_heights = list(block.get("_table_row_heights") or [])
-                    merged_row_lhs = list(block.get("_table_row_line_heights") or [])
-                    merged_cell_styles = list(block.get("_table_cell_styles") or [])
-                    # 向后扫描 page_idx+1 直到遇到有 HTML 的 table 或页面结束
+                        continue  # 续页 block 无 HTML，跳过（在下方被主block分发处理）
+                    # 此 block 有 HTML → 跨页表格的主 block
+                    # 本页 PyMuPDF 行数（主block本页应保留的行数）
+                    main_cells = block.get("_pymupdf_cells") or []
+                    main_heights = block.get("_table_row_heights") or []
+                    main_row_lhs = block.get("_table_row_line_heights") or []
+                    main_styles = block.get("_table_cell_styles") or []
+                    n_main = len(main_cells)  # 本页行数
+
+                    # 主block截断：只保留本页数据（已在预扫描中提取，就是 main_cells）
+                    # main_cells 已经是本页的行数据（预扫描只提取了本页），不需要截断
+
+                    # 向后扫描续页，给每个续页block填充独立数据
                     for look_pi in range(pi + 1, len(pdf_info)):
                         look_page = pdf_info[look_pi]
                         look_idx = look_page.get("page_idx", 0)
@@ -2168,9 +2193,8 @@ def build_docx(
                                 continue
                             look_html = _extract_table_html(look_block)
                             if look_html:
-                                # 遇到另一个有 HTML 的 table → 不是续页
-                                break
-                            # 续页 block：合并其 PyMuPDF 数据
+                                break  # 另一个有HTML的table → 不是续页
+                            # 续页 block：填充本页独立数据（不合并到主block）
                             look_bbox = look_block.get("bbox")
                             if not (look_bbox and len(look_bbox) >= 4):
                                 continue
@@ -2179,34 +2203,41 @@ def build_docx(
                                 continue
                             ct = _extract_table_cell_texts(mtable)
                             if ct:
-                                merged_cells.extend(ct)
+                                look_block["_pymupdf_cells"] = ct
+                                # 立即推断合并单元格（PyMuPDF状态共享bug，必须即时计算）
+                                look_block["_table_merged_cells"] = _infer_colspan_rowspan(mtable)
                             fitz_page = fdoc[look_idx]
                             cs = _extract_table_cell_styles(mtable, fitz_page)
                             if cs:
-                                merged_cell_styles.extend(cs)
-                            rh, _, row_lhs = _extract_table_row_geometry(mtable, fitz_page)
+                                look_block["_table_cell_styles"] = cs
+                            rh, tlh, row_lhs = _extract_table_row_geometry(mtable, fitz_page)
                             if rh:
-                                merged_heights.extend(rh)
-                                merged_row_lhs.extend(row_lhs)
-                            # 续页的 _table_line_height（取第一个有效的）
-                            if not block.get("_table_line_height"):
-                                _, tlh, _ = _extract_table_row_geometry(mtable, fitz_page)
-                                if tlh:
-                                    block["_table_line_height"] = tlh
-                            # 标记续页 block 已合并，_build_table 将跳过
-                            look_block["_table_merged"] = True
+                                # 防溢出：同主 block 逻辑，接近页满时等比压缩行高
+                                total_h = sum(rh)
+                                page_h = fitz_page.rect.height
+                                max_table_h = page_h * 0.80
+                                if total_h > max_table_h:
+                                    scale = max_table_h / total_h
+                                    rh = [round(h * scale, 1) for h in rh]
+                                    row_lhs = [round(lh * scale, 1) if lh else None
+                                               for lh in row_lhs]
+                                look_block["_table_row_heights"] = rh
+                                look_block["_table_row_line_heights"] = row_lhs
+                            if tlh:
+                                look_block["_table_line_height"] = tlh
+                            # 列宽
+                            widths = _extract_table_col_widths_from_table(mtable)
+                            if widths:
+                                look_block["_col_widths"] = widths
+                            # 不标记 _table_merged（让它独立渲染）
+                            # 标记为续页表格（触发分页符）
+                            look_block["_crosspage_continuation"] = True
                             found_continuation = True
                         if not found_continuation:
                             break  # 没找到续页 table → 停止扫描
-                    if merged_cells:
-                        block["_pymupdf_cells"] = merged_cells
-                        # 标记为跨页表格主 block，续行合并只对此类 block 生效
-                        block["_table_crosspage"] = True
-                    if merged_heights:
-                        block["_table_row_heights"] = merged_heights
-                        block["_table_row_line_heights"] = merged_row_lhs
-                    if merged_cell_styles:
-                        block["_table_cell_styles"] = merged_cell_styles
+
+                    # 主block也标记为跨页表格（用于分页逻辑判断）
+                    block["_table_crosspage"] = True
 
             # ── 补救 MinerU 漏检的表格 ──
             # MinerU 有时把整个表格误判为多个 text block（如第13页），
@@ -2256,6 +2287,15 @@ def build_docx(
                     if widths:
                         new_block["_col_widths"] = widths
                     if row_heights:
+                        # 防溢出：同主 block 逻辑，接近页满时等比压缩行高
+                        total_h = sum(row_heights)
+                        page_h = fitz_page.rect.height
+                        max_table_h = page_h * 0.80
+                        if total_h > max_table_h:
+                            scale = max_table_h / total_h
+                            row_heights = [round(h * scale, 1) for h in row_heights]
+                            row_lhs = [round(lh * scale, 1) if lh else None
+                                       for lh in row_lhs]
                         new_block["_table_row_heights"] = row_heights
                         new_block["_table_row_line_heights"] = row_lhs
                     if text_lh:
@@ -2414,6 +2454,227 @@ def build_docx(
     return str(output_path.resolve())
 
 
+# ═══════════════════════════════════════════════════════════════
+#  回归检测：渲染后对比 PDF，微调表格行高消除页面偏移
+# ═══════════════════════════════════════════════════════════════
+
+def _render_docx_to_pdf(
+    docx_path: str, out_dir: str,
+) -> str | None:
+    """用 LibreOffice headless 把 DOCX 转成 PDF，返回 PDF 路径。"""
+    import subprocess, shutil, os
+    soffice = shutil.which("soffice") or shutil.which("libreoffice")
+    if not soffice:
+        for p in (r"C:\Program Files\LibreOffice\program\soffice.exe",
+                  r"C:\Program Files (x86)\LibreOffice\program\soffice.exe"):
+            if os.path.isfile(p):
+                soffice = p
+                break
+    if not soffice:
+        print("  ⚠️ 回归检测: 未找到 LibreOffice，跳过", file=sys.stderr)
+        return None
+    try:
+        subprocess.run(
+            [soffice, "--headless", "--convert-to", "pdf",
+             "--outdir", out_dir, docx_path],
+            capture_output=True, timeout=120,
+        )
+        pdf_path = os.path.join(out_dir,
+                                os.path.splitext(os.path.basename(docx_path))[0] + ".pdf")
+        return pdf_path if os.path.isfile(pdf_path) else None
+    except Exception:
+        return None
+
+
+def _normalize_page_text(txt: str) -> str:
+    """归一化页面文本：去页码、去空白，取前40字符用于对比。"""
+    import re
+    lines = [l.strip() for l in txt.split("\n") if l.strip()]
+    content = [l for l in lines if not re.match(r'^[—\-]?\s*\d{1,3}\s*[—\-]?$', l)]
+    return re.sub(r'\s+', '', "".join(content))[:40]
+
+
+def _check_page_alignment(
+    docx_pdf_path: str, orig_pdf_path: str,
+    pdf_info: list | None = None,
+) -> tuple[list[int], int]:
+    """
+    对比 DOCX 渲染 PDF 和原始 PDF 的每页首行，返回偏移信息。
+
+    如果传入 pdf_info，只检测含表格的页面（偏移主要由表格行高差异引起，
+    正文区域已由分页符固定，检测正文页会因格式微差误报）。
+
+    返回 (misaligned_pages, first_offset)
+      - misaligned_pages: 不对齐的页码列表（1-based）
+      - first_offset: 首个偏移页的偏移方向（+1=DOCX超前, -1=DOCX落后, 0=全对齐）
+    """
+    import fitz, re
+    d = fitz.open(docx_pdf_path)
+    o = fitz.open(orig_pdf_path)
+    max_p = min(d.page_count, o.page_count)
+
+    def _full_text(txt):
+        """归一化整页文本（去页码去空白），用于内容搜索。"""
+        lines = [l.strip() for l in txt.split("\n") if l.strip()]
+        content = [l for l in lines if not re.match(r'^[—\-]?\s*\d{1,3}\s*[—\-]?$', l)]
+        return re.sub(r'\s+', '', "".join(content))
+
+    # 如果有 pdf_info，只检测含表格的页面
+    table_pages = None
+    if pdf_info:
+        table_pages = set()
+        for pi, page in enumerate(pdf_info):
+            if not isinstance(page, dict):
+                continue
+            for b in (page.get("para_blocks") or page.get("blocks") or []):
+                if (b.get("type") or "").lower() == "table":
+                    table_pages.add(pi)
+                    break
+
+    misaligned = []
+    first_offset = 0
+    for pno in range(max_p):
+        if table_pages is not None and pno not in table_pages:
+            continue
+        d_txt = _normalize_page_text(d[pno].get_text())
+        o_txt = _normalize_page_text(o[pno].get_text())
+        if d_txt == o_txt:
+            continue
+        misaligned.append(pno + 1)
+        if first_offset == 0:
+            # 双向检测偏移方向：
+            # 方向A：DOCX首行在PDF哪页（DOCX超前=在上一页, 落后=在下一页）
+            # 方向B：PDF首行在DOCX哪页（PDF首行在DOCX上一页=DOCX落后, 在下一页=DOCX超前）
+            d_head = _full_text(d[pno].get_text())[:15]
+            o_head = _full_text(o[pno].get_text())[:15]
+            # 检查DOCX首行在PDF邻近页
+            if d_head and pno > 0 and d_head in _full_text(o[pno - 1].get_text()):
+                first_offset = 1   # DOCX 首行在 PDF 上一页 → DOCX 超前
+            elif d_head and pno + 1 < o.page_count and d_head in _full_text(o[pno + 1].get_text()):
+                first_offset = -1  # DOCX 首行在 PDF 下一页 → DOCX 落后
+            # 反向检查：PDF首行在DOCX邻近页
+            elif o_head and pno > 0 and o_head in _full_text(d[pno - 1].get_text()):
+                first_offset = -1  # PDF 首行在 DOCX 上一页 → DOCX 落后（内容少了）
+            elif o_head and pno + 1 < d.page_count and o_head in _full_text(d[pno + 1].get_text()):
+                first_offset = 1   # PDF 首行在 DOCX 下一页 → DOCX 超前（内容多了）
+            # 方向=0(未匹配)时继续找下一个不对齐页
+
+    d.close()
+    o.close()
+    return misaligned, first_offset
+
+
+def _auto_align_tables(
+    merged_data: dict[str, Any], images_dir: str | None,
+    output_path: str | Path, pdf_path: str,
+    max_rounds: int = 5,
+) -> str:
+    """
+    回归检测+行高微调：build → 渲染 → 检测偏移 → 调整表格行高补偿 → 重复。
+
+    每轮：
+    1. build_docx 生成 DOCX（带当前补偿值）
+    2. LibreOffice 渲染成 PDF
+    3. fitz 对比每页首行，找偏移
+    4. 给偏移源的表格 block 加/减补偿值
+    收敛条件：全对齐，或达到 max_rounds。
+    """
+    pdf_info = merged_data.get("pdf_info", merged_data if isinstance(merged_data, list) else [])
+    output_path = Path(output_path)
+    tmp_dir = str(output_path.parent / "_align_tmp")
+
+    import os, shutil
+    os.makedirs(tmp_dir, exist_ok=True)
+
+    for round_num in range(1, max_rounds + 1):
+        # 1. build
+        result = build_docx(merged_data, images_dir, output_path, pdf_path=None)
+        print(f"  🔄 回归检测第{round_num}轮: build完成", file=sys.stderr)
+
+        # 2. 渲染
+        os.makedirs(tmp_dir, exist_ok=True)
+        # 把 output.docx 复制到 tmp（避免 LibreOffice 锁文件）
+        tmp_docx = os.path.join(tmp_dir, "align_check.docx")
+        import shutil
+        shutil.copy2(str(output_path), tmp_docx)
+        rendered_pdf = _render_docx_to_pdf(tmp_docx, tmp_dir)
+        if not rendered_pdf:
+            break  # 无法渲染，放弃
+
+        # 3. 检测（只检测表格页的偏移）
+        misaligned, offset = _check_page_alignment(rendered_pdf, pdf_path, pdf_info)
+        if not misaligned:
+            print(f"  ✅ 回归检测: 全部页对齐", file=sys.stderr)
+            break
+
+        if offset == 0:
+            # 有不对齐页但无法判断方向（如目录点号差异），视为收敛
+            print(f"  ✅ 回归检测: {len(misaligned)}页有格式差异但无内容偏移，收敛",
+                  file=sys.stderr)
+            break
+
+        print(f"  📍 偏移方向={offset:+d}, 不对齐共{len(misaligned)}页: {misaligned[:10]}",
+              file=sys.stderr)
+
+        # 4. 给偏移页附近的表格 block 加补偿
+        # DOCX超前(offset=+1) → 表格矮了 → 需要加高行高 → 补偿 +=
+        # DOCX落后(offset=-1) → 表格高了 → 需要减高行高 → 补偿 -=
+        # 只调第一个偏移页的表格（避免过调），每轮加3pt/行（快速收敛）
+        adjusted = _adjust_table_compensation(pdf_info, misaligned[0], offset)
+        if not adjusted:
+            print(f"  ⚠️ 偏移页附近未找到可调整的表格，停止", file=sys.stderr)
+            break
+
+    # 最终 build（确保用最新补偿值）
+    result = build_docx(merged_data, images_dir, output_path, pdf_path=pdf_path)
+    return result
+
+
+def _adjust_table_compensation(
+    pdf_info: list, bad_page_1based: int, offset: int,
+) -> bool:
+    """
+    给偏移源的表格 block 调整行高补偿值。
+
+    bad_page_1based: 首个有明确方向的偏移页（1-based）
+    offset: +1=DOCX超前(需加高), -1=DOCX落后(需减高)
+
+    策略：从偏移页向前搜索最近的表格 block（偏移由前方表格矮/高引起），
+    给它们的行高补偿叠加微调。每轮微调量固定为2pt/行（保守，避免过冲）。
+    """
+    target_pi = bad_page_1based - 1  # 0-based page_idx
+    # 从偏移页向前搜索最近的表格（最多搜5页）
+    check_pages = list(range(max(0, target_pi - 5), target_pi + 1))
+    adjusted = False
+
+    for pi in check_pages:
+        if pi < 0 or pi >= len(pdf_info):
+            continue
+        page = pdf_info[pi]
+        if not isinstance(page, dict):
+            continue
+        blocks = page.get("para_blocks") or page.get("blocks") or []
+        for b in blocks:
+            if (b.get("type") or "").lower() != "table":
+                continue
+            if b.get("_table_merged"):
+                continue
+            # 补偿值不依赖 _table_row_heights（该字段在 build 内部生成，不存 JSON）
+            # 只要 block 是 table 类型且有 bbox（build 时会提取行高）就加补偿
+            # 计算补偿方向：
+            # offset=+1 (DOCX超前,内容多了) → 表格矮了 → 加高 → comp +=
+            # offset=-1 (DOCX落后,内容少了) → 表格高了 → 减高 → comp -=
+            sign = 1 if offset > 0 else -1
+            # 累积偏移93pt分布在33行表格中 ≈ 2.8pt/行，3轮迭代每轮约1pt/行
+            delta = sign * 1.0
+            old_comp = b.get("_row_height_compensation", 0)
+            b["_row_height_compensation"] = old_comp + delta
+            adjusted = True
+            print(f"    → pi={pi} 表格补偿: {old_comp:+.1f} → {b['_row_height_compensation']:+.1f}pt/行",
+                  file=sys.stderr)
+    return adjusted
+
+
 def _add_vertical_gap(doc, gap_pt: float) -> None:
     """
     插入垂直留白（用空段落的段前距实现）。
@@ -2430,9 +2691,16 @@ def _add_vertical_gap(doc, gap_pt: float) -> None:
 
 
 def _add_page_break(doc) -> None:
-    """插入分页符。"""
+    """插入分页符（段落行高设为最小，避免表格填满页时分页符段落溢出产生空页）。"""
     from docx.enum.text import WD_BREAK
+    from docx.shared import Pt
+    from docx.enum.text import WD_LINE_SPACING
     para = doc.add_paragraph()
+    pf = para.paragraph_format
+    pf.space_before = Pt(0)
+    pf.space_after = Pt(0)
+    pf.line_spacing_rule = WD_LINE_SPACING.EXACTLY
+    pf.line_spacing = Pt(1)  # 最小行高，避免空段落占整行空间
     run = para.add_run()
     run.add_break(WD_BREAK.PAGE)
 

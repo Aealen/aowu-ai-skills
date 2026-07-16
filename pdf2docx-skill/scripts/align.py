@@ -326,13 +326,61 @@ def _inject_underline_spans(
 
         # 按 x 坐标插入到 spans 正确位置
         spans_list = target_line.setdefault("spans", [])
-        insert_idx = len(spans_list)
+
+        # 检查下划线是否落在某个 span 的 x 范围内（MinerU 常把整行合并成一个 span）
+        # 若是，需要拆分该 span：在下划线位置切开，前半段保留、中间插下划线、后半段另起
+        split_info = None  # (span_idx, front_text, back_text, front_bbox, back_bbox)
         for i, sp in enumerate(spans_list):
-            sp_x0 = (sp.get("bbox") or [0])[0]
-            if ul_x0 < sp_x0:
-                insert_idx = i
+            sbbox = sp.get("bbox") or []
+            if len(sbbox) < 4:
+                continue
+            sp_x0, sp_x1 = sbbox[0], sbbox[2]
+            # 下划线落在此 span 内部（不是在 span 边界之外）
+            if sp_x0 + 2 <= ul_x0 and ul_x1 <= sp_x1 - 2:
+                content = sp.get("content", "")
+                sp_w = sp_x1 - sp_x0
+                if sp_w <= 0 or not content:
+                    break
+                # 按 x 比例拆分文本（等宽字体假设：字符宽度均匀）
+                front_ratio = (ul_x0 - sp_x0) / sp_w
+                n_chars = len(content)
+                front_n = round(front_ratio * n_chars)
+                front_text = content[:front_n]
+                back_text = content[front_n:]
+                # 拆分后的 bbox（前段到下划线起点，后段从下划线终点）
+                front_bbox = [sp_x0, sbbox[1], ul_x0, sbbox[3]]
+                back_bbox = [ul_x1, sbbox[1], sp_x1, sbbox[3]]
+                split_info = (i, front_text, back_text, front_bbox, back_bbox)
                 break
-        spans_list.insert(insert_idx, virtual_span)
+
+        if split_info is not None:
+            # 拆分目标 span：原 span 缩为前半段，后半段作为新 span 插入到下划线后
+            si, front_text, back_text, front_bbox, back_bbox = split_info
+            orig_span = spans_list[si]
+            # 前半段：复用原 span，改文本和 bbox
+            orig_span["content"] = front_text
+            orig_span["bbox"] = front_bbox
+            # 插入虚拟下划线 span
+            spans_list.insert(si + 1, virtual_span)
+            # 后半段：克隆原 span 样式，新文本和 bbox
+            if back_text:
+                back_span = {
+                    "bbox": back_bbox,
+                    "content": back_text,
+                    "type": orig_span.get("type", "text"),
+                }
+                if orig_span.get("_style"):
+                    back_span["_style"] = dict(orig_span["_style"])
+                spans_list.insert(si + 2, back_span)
+        else:
+            # 正常情况：下划线在 span 之间，按 x0 找插入位置
+            insert_idx = len(spans_list)
+            for i, sp in enumerate(spans_list):
+                sp_x0 = (sp.get("bbox") or [0])[0]
+                if ul_x0 < sp_x0:
+                    insert_idx = i
+                    break
+            spans_list.insert(insert_idx, virtual_span)
         injected += 1
 
     return injected
