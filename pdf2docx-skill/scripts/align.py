@@ -136,28 +136,179 @@ def _find_best_match(
 ) -> dict[str, Any] | None:
     """
     在候选 spans 中找与 target_bbox 最匹配的 span。
-    匹配策略：优先 IoU，IoU 不足时看包含关系。
+    匹配策略：优先 X 轴重叠比（同一行内），X 不足时用面积 IoU，
+    IoU 不足时看包含关系。
+    
+    用 X 轴重叠比而非面积 IoU 的原因：同一行的不同 span 可能因
+    基线/下行间距差异导致 y 范围不同（如 URL 的 y 范围比中文宽），
+    面积 IoU 会偏向 y 范围大的 span，导致中英文混排时字体选错。
     """
     best = None
     best_score = 0.0
 
+    # 先算一遍 X 轴重叠比（只关注水平位置匹配，忽略 y 高度差异）
     for cand in candidates:
         cand_bbox = cand["bbox"]
-        # 优先 IoU
-        iou = calc_iou(target_bbox, cand_bbox)
-        if iou > best_score:
-            best_score = iou
-            best = cand
+        # X 轴重叠
+        x_overlap = min(target_bbox[2], cand_bbox[2]) - max(target_bbox[0], cand_bbox[0])
+        if x_overlap <= 0:
             continue
-        # IoU 不足时，看 target 是否被候选包含（target 是候选的一部分）
-        containment = calc_containment(target_bbox, cand_bbox)
-        if containment > best_score and containment > iou_threshold:
-            best_score = containment
+        # Y 轴重叠（验证在同一行）
+        y_overlap = min(target_bbox[3], cand_bbox[3]) - max(target_bbox[1], cand_bbox[1])
+        if y_overlap <= 0:
+            continue
+        # X 轴重叠率 = X 重叠 / max(target宽, cand宽)
+        x_ratio = x_overlap / max(target_bbox[2] - target_bbox[0],
+                                    cand_bbox[2] - cand_bbox[0])
+        if x_ratio > best_score:
+            best_score = x_ratio
             best = cand
+
+    # X 轴匹配不充分时，用面积 IoU 兜底
+    if not best:
+        for cand in candidates:
+            cand_bbox = cand["bbox"]
+            iou = calc_iou(target_bbox, cand_bbox)
+            if iou > best_score:
+                best_score = iou
+                best = cand
+                continue
+            containment = calc_containment(target_bbox, cand_bbox)
+            if containment > best_score and containment > iou_threshold:
+                best_score = containment
+                best = cand
 
     if best and best_score > iou_threshold:
         return best
     return None
+
+
+def _split_span_by_fonts(
+    mspan: dict[str, Any],
+    page_spans: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """
+    当 MinerU span 覆盖多个不同字体的 PyMuPDF span 时，
+    按字体边界拆分 MinerU span，使每个子 span 有正确的字体。
+    
+    拆分策略：用 PyMuPDF span 的文本在 MinerU 文本中定位边界，
+    而非依赖坐标比例（中英文混排时字符宽度差异大，比例法不准）。
+    """
+    m_bbox = mspan.get("bbox")
+    if not m_bbox or len(m_bbox) < 4:
+        return [mspan]
+    
+    mx0, mx1 = m_bbox[0], m_bbox[2]
+    mw = mx1 - mx0
+    if mw <= 0:
+        return [mspan]
+    
+    # 收集与 MinerU span 重叠的 PyMuPDF spans（按 x 排序）
+    overlapping = []
+    for cand in page_spans:
+        cbbox = cand.get("bbox", [])
+        if len(cbbox) < 4:
+            continue
+        ox0 = max(mx0, cbbox[0])
+        ox1 = min(mx1, cbbox[2])
+        if ox1 - ox0 <= 0:
+            continue
+        oy0 = max(m_bbox[1], cbbox[1])
+        oy1 = min(m_bbox[3], cbbox[3])
+        if oy1 - oy0 <= 0:
+            continue
+        overlapping.append(cand)
+    
+    if len(overlapping) <= 1:
+        # 只覆盖一个 PyMuPDF span，不需要拆分（下方 _attach_styles 会直接贴样式）
+        return [mspan]
+    
+    overlapping.sort(key=lambda s: s["bbox"][0])
+    
+    # 检查是否有不同字体
+    fonts = set(s.get("font", "") for s in overlapping)
+    if len(fonts) <= 1:
+        return [mspan]
+    
+    # 用文本搜索定位字体边界
+    # 策略：在 MinerU 文本中搜索每个 PyMuPDF span 的文本，找到切分位置
+    mtext = mspan.get("content", "")
+    if not mtext:
+        return [mspan]
+    
+    # 找到所有切分点（在 mtext 中的字符位置）
+    split_points = []  # [(char_pos, font, size, bold, italic, color, underline)]
+    search_start = 0
+    for cand in overlapping:
+        ctext = cand.get("text", "") or cand.get("content", "")
+        if not ctext:
+            continue
+        # 在 MinerU 文本中模糊搜索（从上次结束位置开始）
+        # 先尝试精确匹配
+        idx = mtext.find(ctext, search_start)
+        if idx < 0:
+            # 尝试去除首尾空格后匹配
+            stripped = ctext.strip()
+            if stripped:
+                idx = mtext.find(stripped, search_start)
+        if idx < 0:
+            # 尝试匹配前几个字符
+            if len(ctext) > 2:
+                idx = mtext.find(ctext[:min(5, len(ctext))], search_start)
+        if idx >= 0:
+            # 找到：记录此段
+            end_pos = idx + len(ctext)
+            split_points.append((
+                idx, end_pos,
+                cand.get("font", "FangSong"),
+                cand.get("size", 12.0),
+                cand.get("bold", False),
+                cand.get("italic", False),
+                cand.get("color", 0),
+                cand.get("underline", False),
+            ))
+            search_start = end_pos
+    
+    if len(split_points) <= 1:
+        return [mspan]
+    
+    # 合并相邻相同字体的段
+    merged = []
+    for sp in split_points:
+        start, end = sp[0], sp[1]
+        font_key = sp[2:]
+        if merged and merged[-1][2:] == font_key:
+            # 同字体，扩展
+            merged[-1] = (merged[-1][0], end) + font_key
+        else:
+            merged.append(sp)
+    
+    if len(merged) <= 1:
+        return [mspan]
+    
+    # 构建拆分后的 span 列表
+    result = []
+    for start, end, font, size, bold, italic, color, underline in merged:
+        seg_text = mtext[start:end]
+        if not seg_text:
+            continue
+        # 按比例估算 bbox
+        ratio0 = start / len(mtext) if len(mtext) > 0 else 0
+        ratio1 = end / len(mtext) if len(mtext) > 0 else 1
+        new_span = dict(mspan)
+        new_span["content"] = seg_text
+        new_span["bbox"] = [
+            mx0 + ratio0 * mw, m_bbox[1],
+            mx0 + ratio1 * mw, m_bbox[3],
+        ]
+        new_span["_style"] = {
+            "font": font, "size": size,
+            "bold": bold, "italic": italic,
+            "color": color, "underline": underline,
+        }
+        result.append(new_span)
+    
+    return result if len(result) > 1 else [mspan]
 
 
 def _attach_styles_to_block(
@@ -170,6 +321,9 @@ def _attach_styles_to_block(
     把 PyMuPDF 样式贴到 MinerU block 的 lines.spans 上。
     MinerU 的 span 有 bbox + content，PyMuPDF 的 span 有 bbox + 样式，
     用 bbox 匹配把样式贴过去。
+    
+    当 MinerU span 覆盖了多个不同字体的 PyMuPDF span 时，
+    会按字体边界拆分成多个子 span（如中英文混排行）。
 
     MinerU block 结构（middle.json）:
       block.lines[].spans[] —— 每个 span 有 bbox 和 content
@@ -177,11 +331,20 @@ def _attach_styles_to_block(
     直接修改 block（in-place），给匹配到的 span 加 _style 字段。
     """
     for line in block.get("lines", []):
+        new_spans = []
         for mspan in line.get("spans", []):
             m_bbox = mspan.get("bbox")
             stats["total"] += 1
             if not m_bbox:
                 stats["no_bbox"] += 1
+                new_spans.append(mspan)
+                continue
+
+            # 按字体边界拆分（中英文混排）
+            split_spans = _split_span_by_fonts(mspan, page_spans)
+            if len(split_spans) > 1:
+                stats["matched"] += len(split_spans)
+                new_spans.extend(split_spans)
                 continue
 
             best = _find_best_match(m_bbox, page_spans, iou_threshold)
@@ -197,6 +360,8 @@ def _attach_styles_to_block(
                 stats["matched"] += 1
             else:
                 stats["unmatched"] += 1
+            new_spans.append(mspan)
+        line["spans"] = new_spans
 
 
 def _attach_style_to_block_fallback(

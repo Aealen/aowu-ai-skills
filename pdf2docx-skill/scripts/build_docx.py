@@ -265,21 +265,31 @@ def _apply_paragraph_format(para, block: dict[str, Any] | None = None) -> None:
     else:
         pf.alignment = WD_ALIGN_PARAGRAPH.JUSTIFY
         # 缩进：分两层
-        # left_indent = 续行 x0（所有行的最小 x0）相对左边距的偏移
-        # first_line_indent = 首行 x0 相对续行 x0 的额外偏移（首行缩进）
-        min_x0 = first_x0
+        # left_indent = 续行 x0 相对左边距的偏移
+        # first_line_indent = 首行 x0 相对续行 x0 的额外偏移（悬挂缩进）
+        # 续行参考用所有 line bbox（MinerU 原始）的最小 x0，不用 span bbox
+        # （字体拆分会产生估算 bbox 的 span，污染统计）。
+        # 单行 block 仅有首行无续行，left_indent=0 first_line=first_x0-page_x0。
+        min_line_x0 = first_x0
+        line_x0s = []
         for line in lines:
-            spans = line.get("spans", [])
-            if spans:
-                lx0 = spans[0].get("bbox", [min_x0])[0]
-                if lx0 < min_x0:
-                    min_x0 = lx0
+            lbbox = line.get("bbox", [])
+            if lbbox and len(lbbox) >= 4:
+                lx0 = round(lbbox[0])
+                line_x0s.append(lx0)
+                if lx0 < min_line_x0:
+                    min_line_x0 = lx0
+        if line_x0s:
+            # 续行参考：用最小 x0（代表所有续行中最靠左的位置）
+            ref_x0 = min(line_x0s)
+        else:
+            ref_x0 = first_x0
         # left_indent：续行的起始位置
-        left_indent_pt = max(0, min_x0 - page_x0)
+        left_indent_pt = max(0, ref_x0 - page_x0)
         if left_indent_pt > 6:
             pf.left_indent = Pt(round(left_indent_pt))
         # first_line_indent：首行相对续行的额外缩进
-        first_indent_pt = max(0, first_x0 - min_x0)
+        first_indent_pt = max(0, first_x0 - ref_x0)
         if first_indent_pt > 6:
             pf.first_line_indent = Pt(round(first_indent_pt))
         else:
@@ -1950,17 +1960,12 @@ def _detect_page_margins(pdf_path: str, pdf_info: list) -> dict[str, float] | No
                     x1s.append(bx[2])
         if y0s and y1s:
             # 上下左右边距：都要同时考虑文字 span 和表格 bbox 的边界。
-            # 表格边框线比文字 span 更靠外（cell 有内边距，且表格可能比正文更宽更高）。
-            # - 左右：不合并 → 内容区比表格窄，cell 被压缩、文字换行
-            # - 上下：不合并 → 内容区高度比 PDF 实际小（表格顶到72pt但文字span在80pt），
-            #   atLeast 行高的表格在 WPS 下因剩余空间不足把整行推到下一页。
             top_min = min(y0s)
             bottom_max = max(y1s)
             left_min = min(x0s)
             right_max = max(x1s)
             try:
                 for tab in page.find_tables().tables:
-                    # 排除页脚位置的表格（如全宽页脚表），避免污染边距统计
                     if tab.bbox[1] >= ph - 60:
                         continue
                     top_min = min(top_min, tab.bbox[1])
@@ -1986,14 +1991,8 @@ def _detect_page_margins(pdf_path: str, pdf_info: list) -> dict[str, float] | No
 
     return {
         # 上下左右边距都取最小值：内容最靠四边的页反映真实可用内容区。
-        # 上边距用中位数曾导致表格页（表格边框顶到 72pt，但文字 span 在 80pt）
-        # 的上边距被高估为 80pt，内容区高度比 PDF 实际小 7.8pt，
-        # atLeast 行高的表格在 WPS 下因剩余空间不足把整行推到下一页。
         "top": min(top_margins),
-        "bottom": min(bottom_margins),   # 最小值（内容最满的页反映真实下边距）
-        # 左右边距取最小值：确保内容区足够宽以容纳最宽的内容（如跨页表格）。
-        # 用中位数会导致表格页（bbox 更宽）的内容超出内容区，
-        # 被 Word/WPS 在 fixed 布局下强制压缩，cell 变窄、文字换行。
+        "bottom": min(bottom_margins),
         "left": min(left_margins),
         "right": min(right_margins),
     }
