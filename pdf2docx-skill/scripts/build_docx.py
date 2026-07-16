@@ -2339,43 +2339,33 @@ def build_docx(
         if page_idx > 0:
             prev_block_bottom = None
 
-        # 分页：每页第一个 block 是标题时插分页符
-        # 这样封面/目录/章节标题各自从新页开始，正文续页不分页
+        # 分页：在 PDF 页面边界插分页符，防止 DOCX 流式布局偏移累积。
+        # 但不能简单"每页都分页"——大表格/跨页内容会打破 MinerU page_idx
+        # 与 DOCX 物理页的一一对应，导致空页。
+        # 策略：只在该页首个 block 是"真正的页面起点"时才分页。
+        # 判据：首个有内容的 block 在页首区域（y0 < 页高 15%），且该页
+        # 没有大表格占据整页（否则 block 在表格下方，不是页面起点）。
         if page_idx > 0 and blocks:
-            first_btype = (blocks[0].get("type") or blocks[0].get("block_type") or "").lower()
-            if first_btype == "title":
-                _add_page_break(doc)
-            elif first_btype in ("text", "paragraph"):
-                # 非标题的强分页检测：PDF 中上页正文没写满就翻页，
-                # 且本页 block#0 在页首 → PDF 有强制分页意图（如"响应文件封面"参考格式页）。
-                # 判据（全部满足）：
-                #   1. 本页 block#0 在页首（y0 < 页高 14%）
-                #   2. 上一页最后一个有内容的 block 也是 text/paragraph（排除表格续页干扰）
-                #   3. 上页最后 block 的 y1 明显低于正常页底（< 页高 60%）
-                #      正常正文页 y1≈700-760，强分页页 y1≈280（只写1/3页）
-                f0_bbox = blocks[0].get("bbox") or []
-                f0_y0 = f0_bbox[1] if len(f0_bbox) >= 4 else page_height
-                if f0_y0 < page_height * 0.14:
-                    # 找上一页最后一个有内容的 block
-                    prev_page = pdf_info[page_idx - 1] if page_idx > 0 else None
-                    if isinstance(prev_page, dict):
-                        prev_blocks = (prev_page.get("para_blocks")
-                                       or prev_page.get("blocks") or [])
-                        for pb in reversed(prev_blocks):
-                            pb_lines = pb.get("lines") or []
-                            pb_txt = "".join(
-                                s.get("content", "")
-                                for ln in pb_lines for s in ln.get("spans", [])
-                            )
-                            if pb_txt.strip():
-                                pb_type = (pb.get("type")
-                                           or pb.get("block_type") or "").lower()
-                                pb_bbox = pb.get("bbox") or []
-                                pb_y1 = pb_bbox[3] if len(pb_bbox) >= 4 else page_height
-                                if (pb_type in ("text", "paragraph")
-                                        and pb_y1 < page_height * 0.60):
-                                    _add_page_break(doc)
-                                break  # 只看最后一个有内容的 block
+            for b in blocks:
+                if b.get("_crosspage_continuation"):
+                    break  # 跨页续行，由 block 循环内的逻辑处理
+                btype = (b.get("type") or b.get("block_type") or "").lower()
+                # 表格 block 不触发分页（表格自身可能跨多页）
+                if btype == "table":
+                    break
+                lines = b.get("lines") or []
+                txt = "".join(
+                    s.get("content", "")
+                    for ln in lines for s in ln.get("spans", [])
+                ).strip()
+                if not txt:
+                    continue  # 跳过空 block
+                # 首个有内容 block 在页首 → 是页面起点 → 分页
+                bbox = b.get("bbox") or []
+                y0 = bbox[1] if len(bbox) >= 4 else page_height
+                if y0 < page_height * 0.15:
+                    _add_page_break(doc)
+                break  # 只看首个有效 block
 
 
         for block in blocks:
