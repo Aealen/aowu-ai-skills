@@ -135,18 +135,27 @@ def _get_dominant_size(block: dict[str, Any] | None) -> float:
     return max(size_counter, key=size_counter.get)
 
 
-def _detect_page_layout(pdf_info: list, margins: dict | None = None) -> None:
+def _detect_page_layout(
+    pdf_info: list,
+    margins: dict | None = None,
+    per_page_margins: dict[int, dict[str, float]] | None = None,
+) -> None:
     """
     从每页的 block bbox 数据中检测页面布局参数，注入到每个 block 中。
 
     检测内容：
-      - _page_x0: 正文左边距（优先用 PyMuPDF 精确检测的 margins，回退到 bbox 统计）
+      - _page_x0: 正文左边距（优先用 per_page_margins 逐页精确值，
+                  回退到全局 margins，再回退到 bbox 统计）
       - _page_width: 页宽（page_size[0]）
       - _page_center: 页面水平中心
+
+    ⚠️ _page_x0 用于居中判断（left_gap/right_gap 对称性）和左缩进计算
+    （ref_x0 - page_x0）。全局值会导致每页基准偏移（实测偏差 +20~+55pt），
+    误判中等长度左对齐行为居中、且缩进偏大。因此优先用逐页边距。
     """
     from collections import Counter
 
-    # 文档级左边距：优先用 PyMuPDF 精确检测的值，回退到 bbox 统计
+    # 全局左边距回退值：PyMuPDF 检测的 margins 或 bbox 统计
     if margins and "left" in margins:
         doc_x0 = margins["left"]
     else:
@@ -170,13 +179,20 @@ def _detect_page_layout(pdf_info: list, margins: dict | None = None) -> None:
             doc_x0 = round(all_text_x0s[len(all_text_x0s) // 4] / 3) * 3
 
     for page in pdf_info:
+        pi = page.get("page_idx", 0)
         page_size = page.get("page_size", [595, 842])
         page_width = page_size[0] if len(page_size) > 0 else 595
         page_center = page_width / 2
 
+        # 逐页左边距：优先用 per_page_margins 的精确值，回退到全局 doc_x0
+        if per_page_margins and pi in per_page_margins:
+            page_x0 = per_page_margins[pi].get("left", doc_x0)
+        else:
+            page_x0 = doc_x0
+
         blocks = page.get("para_blocks") or page.get("blocks") or []
         for block in blocks:
-            block["_page_x0"] = doc_x0
+            block["_page_x0"] = page_x0
             block["_page_width"] = page_width
             block["_page_center"] = page_center
 
@@ -241,21 +257,29 @@ def _apply_paragraph_format(para, block: dict[str, Any] | None = None) -> None:
             expected_x0 = page_center - line_width / 2
             total_lines += 1
             # 居中行：中心接近页面中心 + 行宽未占满 + 实际 x0 接近期望 x0
+            # + 左侧有明显留白（排除左对齐行恰好填到接近右边距导致中心接近页面中心）
+            left_margin_gap = line_bbox[0] - page_x0
             if (abs(line_center - page_center) < page_width * 0.05 and
                     line_width < content_width * 0.90 and
-                    abs(line_bbox[0] - expected_x0) < page_width * 0.05):
+                    abs(line_bbox[0] - expected_x0) < page_width * 0.05 and
+                    left_margin_gap > page_width * 0.08):
                 centered_lines += 1
 
     if total_lines > 0 and centered_lines >= total_lines / 2:
         is_centered = True
     elif bbox and len(bbox) >= 4:
-        # 单行 block 回退到 bbox 对称性判断
-        left_gap = bbox[0] - page_x0
-        right_gap = page_width - page_x0 - bbox[2]
-        gap_diff = abs(left_gap - right_gap)
-        is_centered = (gap_diff < page_width * 0.05 and
-                       left_gap > page_width * 0.02 and
-                       right_gap > page_width * 0.02)
+        # 单行 block：用"首行 x0 是否接近居中期望起始位置"判断
+        # 居中行的起始 x0 = 页面中心 - 行宽/2；左对齐行 x0 ≈ 左边距。
+        # 用"期望 x0 匹配"而非"左右 gap 对称性"——后者会把恰好填到
+        # 接近右边距的左对齐行误判为居中（如"代理机构：xxx有限公司"）。
+        line_width = bbox[2] - bbox[0]
+        expected_x0 = page_center - line_width / 2
+        left_margin_gap = bbox[0] - page_x0
+        is_centered = (
+            line_width < content_width * 0.90 and          # 行宽未占满内容区
+            abs(bbox[0] - expected_x0) < page_width * 0.05 and  # 起始位置接近居中期望
+            left_margin_gap > page_width * 0.08            # 左侧有明显留白（远超左边距）
+        )
     else:
         is_centered = False
 
@@ -481,20 +505,26 @@ def _apply_title_format(para, level: int, block: dict | None = None) -> None:
             line_width = line_bbox[2] - line_bbox[0]
             expected_x0 = page_center - line_width / 2
             total_lines += 1
+            left_margin_gap = line_bbox[0] - page_x0
             if (abs(line_center - page_center) < page_width * 0.05 and
                     line_width < content_width * 0.90 and
-                    abs(line_bbox[0] - expected_x0) < page_width * 0.05):
+                    abs(line_bbox[0] - expected_x0) < page_width * 0.05 and
+                    left_margin_gap > page_width * 0.08):
                 centered_lines += 1
 
     if total_lines > 0 and centered_lines >= total_lines / 2:
         is_centered = True
     elif bbox and len(bbox) >= 4:
-        left_gap = bbox[0] - page_x0
-        right_gap = page_width - page_x0 - bbox[2]
-        gap_diff = abs(left_gap - right_gap)
-        is_centered = (gap_diff < page_width * 0.05 and
-                       left_gap > page_width * 0.02 and
-                       right_gap > page_width * 0.02)
+        # 单行 block：用"首行 x0 是否接近居中期望起始位置"判断
+        # （同 _apply_paragraph_format，避免左右 gap 对称性误判）
+        line_width = bbox[2] - bbox[0]
+        expected_x0 = page_center - line_width / 2
+        left_margin_gap = bbox[0] - page_x0
+        is_centered = (
+            line_width < content_width * 0.90 and
+            abs(bbox[0] - expected_x0) < page_width * 0.05 and
+            left_margin_gap > page_width * 0.08
+        )
     else:
         is_centered = False
 
@@ -2483,7 +2513,7 @@ def build_docx(
                    "left": min(all_l), "right": min(all_r)}
     else:
         margins = None
-    _detect_page_layout(pdf_info, margins)
+    _detect_page_layout(pdf_info, margins, per_page_margins)
 
     # ── 行高兜底值（仅用于 bbox 无效的极端情况）──
     # 正常情况下每个 block 都能从 bbox高度/行数 直接取到精确行高，
