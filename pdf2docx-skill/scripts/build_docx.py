@@ -627,6 +627,57 @@ def _find_matching_pymupdf_table(
     return best_table
 
 
+def _detect_table_border(page, bbox: list[float], tol: float = 8) -> int:
+    """
+    检测 bbox 四条边附近是否有表格边框线，返回检测到的边数（0-4）。
+
+    PyMuPDF find_tables() 对"仅外框无内线"的表格（如单格大表格包正文）
+    检测失败，但这类表格确实有边框。用 PDF 绘图对象（线条/矩形）检测
+    bbox 边缘是否有足够长的线段，作为表格存在的补充判据。
+    """
+    x0, y0, x1, y1 = bbox
+    drawings = page.get_drawings()
+    # 收集所有线段（含矩形的四条边）
+    segs: list[tuple[float, float, float, float]] = []
+    for dr in drawings:
+        for item in dr.get("items", []):
+            if item[0] == "l" and len(item) >= 3:
+                p1, p2 = item[1], item[2]
+                segs.append((p1.x, p1.y, p2.x, p2.y))
+            elif item[0] == "re" and len(item) >= 2:
+                r = item[1]
+                segs.append((r.x0, r.y0, r.x1, r.y0))  # 上
+                segs.append((r.x0, r.y1, r.x1, r.y1))  # 下
+                segs.append((r.x0, r.y0, r.x0, r.y1))  # 左
+                segs.append((r.x1, r.y0, r.x1, r.y1))  # 右
+
+    def _find_edge(is_horizontal: bool, fixed: float, lo: float, hi: float) -> bool:
+        """检测某条边附近是否有覆盖该边 ≥50% 长度的线段。"""
+        edge_len = hi - lo
+        if edge_len <= 0:
+            return False
+        for sx0, sy0, sx1, sy1 in segs:
+            if is_horizontal:
+                if abs((sy0 + sy1) / 2 - fixed) < tol:
+                    seg_len = max(sx0, sx1) - min(sx0, sx1)
+                    if seg_len > edge_len * 0.5:
+                        return True
+            else:
+                if abs((sx0 + sx1) / 2 - fixed) < tol:
+                    seg_len = max(sy0, sy1) - min(sy0, sy1)
+                    if seg_len > edge_len * 0.5:
+                        return True
+        return False
+
+    edges = (
+        _find_edge(True, y0, x0, x1),   # 上边
+        _find_edge(True, y1, x0, x1),   # 下边
+        _find_edge(False, x0, y0, y1),  # 左边
+        _find_edge(False, x1, y0, y1),  # 右边
+    )
+    return sum(edges)
+
+
 def _extract_table_col_widths_from_table(pymupdf_table) -> list[int] | None:
     """
     从 PyMuPDF Table 对象提取列宽（pt）。
@@ -2279,6 +2330,39 @@ def build_docx(
                         fitz_page = fdoc[pi]
                         mtable = _find_matching_pymupdf_table(fdoc, pi, bbox)
                         if mtable is None:
+                            # PyMuPDF 找不到表格。可能是"仅外框无内线"的表格
+                            # （如单格大表格包正文，常见于招标文件前附表的说明栏），
+                            # PyMuPDF find_tables 要求线条交叉推断行列，单格表检测失败。
+                            # 用 PDF 绘图对象检测 bbox 边框：有 ≥3 条边 → 确认是表格，
+                            # 构造 1×1 cell（把 bbox 内文字作为唯一单元格内容），
+                            # 让 _build_table 的 PyMuPDF 路径渲染带边框的表格。
+                            n_edges = _detect_table_border(fitz_page, bbox)
+                            if n_edges >= 3:
+                                clip = fitz.Rect(bbox)
+                                d = fitz_page.get_text("dict", clip=clip)
+                                # 收集 bbox 内所有文字，按 y 排序拼接为单元格文本
+                                cell_lines: list[str] = []
+                                for tb in d.get("blocks", []):
+                                    if tb.get("type") != 0:
+                                        continue
+                                    for line in tb.get("lines", []):
+                                        txt = "".join(
+                                            sp["text"] for sp in line.get("spans", [])
+                                        ).strip()
+                                        if txt:
+                                            cell_lines.append(txt)
+                                if cell_lines:
+                                    block["_pymupdf_cells"] = [["\n".join(cell_lines)]]
+                                    block["_table_merged_cells"] = [
+                                        [{"text": "\n".join(cell_lines),
+                                          "rowspan": 1, "colspan": 1}]
+                                    ]
+                                    # 列宽用 bbox 宽度
+                                    block["_col_widths"] = [round(bbox[2] - bbox[0])]
+                                    texts_found += 1
+                                    print(f"  🔲 第{pi+1}页单格表格: PyMuPDF漏检，"
+                                          f"用边框检测重建1×1表格（{len(cell_lines)}行文字）",
+                                          file=sys.stderr)
                             continue
                         widths = _extract_table_col_widths_from_table(mtable)
                         if widths:
