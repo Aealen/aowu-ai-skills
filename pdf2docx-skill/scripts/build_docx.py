@@ -1388,7 +1388,22 @@ def _build_table(doc, block: dict[str, Any]) -> None:
     table_html = _extract_table_html(block)
 
     # 含合并单元格的复杂表格 → HTML 路径（结构更可靠）
+    # 但如果 HTML 行数与 PyMuPDF 行数不匹配（MinerU 行结构错误），
+    # 放弃 HTML 路径，走 PyMuPDF 路径（_infer_colspan_rowspan 推断合并）
+    use_html = False
     if _html_has_merged_cells(table_html):
+        html_rows = _parse_html_table(table_html)
+        if html_rows and pymupdf_cells:
+            # 行数匹配才用 HTML 路径
+            if len(html_rows) == len(pymupdf_cells):
+                use_html = True
+            else:
+                print(f"  ⚠️ 表格行数不匹配(HTML={len(html_rows)} vs PyMuPDF={len(pymupdf_cells)})，走PyMuPDF路径",
+                      file=sys.stderr)
+        elif html_rows and not pymupdf_cells:
+            use_html = True  # 无 PyMuPDF 数据，只能用 HTML
+
+    if use_html:
         rows = _parse_html_table(table_html)
         if rows:
             max_cols = max(sum(c.get("colspan", 1) for c in row) for row in rows)
