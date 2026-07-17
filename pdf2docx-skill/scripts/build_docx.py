@@ -1998,6 +1998,93 @@ def _detect_page_margins(pdf_path: str, pdf_info: list) -> dict[str, float] | No
     }
 
 
+def _detect_per_page_margins(
+    pdf_path: str, pdf_info: list,
+) -> dict[int, dict[str, float]] | None:
+    """
+    为每个 page_idx 独立计算 PDF 边距（page_idx → {top, bottom, left, right}）。
+
+    每页的边距由该页 span + 表格 bbox 的极值决定：
+    - 上下边距：合并表格 bbox（表格高度占满页面时保证内容区高度）
+    - 左右边距：只用 span，不合并表格 bbox（表格有自己的 _col_widths，
+      不靠页面边距撑宽度；合并会把正文行拉宽）
+    """
+    try:
+        import fitz
+    except ImportError:
+        return None
+
+    try:
+        doc = fitz.open(pdf_path)
+    except Exception:
+        return None
+
+    result: dict[int, dict[str, float]] = {}
+    # 全局上下边距：取所有页最小值（避免封面页的大留白被当成边距）
+    global_top = []
+    global_bottom = []
+
+    for page in pdf_info:
+        pi = page.get("page_idx", 0)
+        if pi >= doc.page_count:
+            continue
+        fpage = doc[pi]
+        d = fpage.get_text("dict")
+        pw = fpage.rect.width
+        ph = fpage.rect.height
+        y0s, y1s, x0s, x1s = [], [], [], []
+        for block in d.get("blocks", []):
+            if block.get("type") != 0:
+                continue
+            for line in block.get("lines", []):
+                ly0 = line["bbox"][1]
+                if ly0 > ph - 60 or ly0 < 60:
+                    continue
+                for sp in line.get("spans", []):
+                    if not sp["text"].strip():
+                        continue
+                    bx = sp["bbox"]
+                    y0s.append(bx[1])
+                    y1s.append(bx[3])
+                    x0s.append(bx[0])
+                    x1s.append(bx[2])
+        if not y0s:
+            continue  # 空页跳过
+
+        top_min = min(y0s)
+        bottom_max = max(y1s)
+        left_min = min(x0s)
+        right_max = max(x1s)
+        try:
+            for tab in fpage.find_tables().tables:
+                if tab.bbox[1] >= ph - 60:
+                    continue
+                # 上下边距合并表格 bbox
+                top_min = min(top_min, tab.bbox[1])
+                bottom_max = max(bottom_max, tab.bbox[3])
+                # 左右边距不合并表格 bbox
+        except Exception:
+            pass
+
+        global_top.append(top_min)
+        global_bottom.append(ph - bottom_max)
+        result[pi] = {
+            "left": round(left_min, 1),
+            "right": round(pw - right_max, 1),
+        }
+
+    doc.close()
+
+    # 上下边距用全局最小值（内容最靠边的页反映真实可用内容区）
+    gt = min(global_top) if global_top else 72
+    gb = min(global_bottom) if global_bottom else 72
+    for pi in result:
+        result[pi]["top"] = round(gt, 1)
+        result[pi]["bottom"] = round(gb, 1)
+
+    return result if result else None
+
+
 def build_docx(
     merged_data: dict[str, Any],
     images_dir: str | None,
@@ -2035,6 +2122,9 @@ def build_docx(
 
     # ── 页面设置：从 PDF 真实尺寸设置纸张大小和边距 ──
     # python-docx 默认用 US Letter，需改为 PDF 的实际尺寸（通常是 A4）
+    # 每页独立边距：不同页面（正文页 vs 表格页）有不同的内容区域宽度
+    per_page_margins = _detect_per_page_margins(pdf_path, pdf_info) if pdf_path else None
+
     if pdf_info:
         first_page = pdf_info[0]
         page_size = first_page.get("page_size", [595, 842])
@@ -2046,14 +2136,20 @@ def build_docx(
         sec.page_width = Mm(pdf_w_pt * 0.3528)
         sec.page_height = Mm(pdf_h_pt * 0.3528)
 
-        # 边距：直接用 PyMuPDF 从 PDF 提取的真实边距，不做任何写死裁剪
-        margins = _detect_page_margins(pdf_path, pdf_info) if pdf_path else None
-
-        if margins:
-            sec.left_margin = Pt(margins["left"])
-            sec.right_margin = Pt(margins["right"])
-            sec.top_margin = Pt(margins["top"])
-            sec.bottom_margin = Pt(margins["bottom"])
+        # 首页边距优先用 per_page_margins，回退到全局 margins
+        if per_page_margins and 0 in per_page_margins:
+            pm = per_page_margins[0]
+            sec.left_margin = Pt(pm["left"])
+            sec.right_margin = Pt(pm["right"])
+            sec.top_margin = Pt(pm["top"])
+            sec.bottom_margin = Pt(pm["bottom"])
+        elif per_page_margins:
+            # 首页无数据，用第一个有效页的边距
+            pm = next(iter(per_page_margins.values()))
+            sec.left_margin = Pt(pm["left"])
+            sec.right_margin = Pt(pm["right"])
+            sec.top_margin = Pt(pm["top"])
+            sec.bottom_margin = Pt(pm["bottom"])
         else:
             # 无 pdf_path 时从 MinerU block bbox 推断
             first_blocks = first_page.get("para_blocks") or first_page.get("blocks") or []
@@ -2064,7 +2160,7 @@ def build_docx(
                     sec.left_margin = Pt(min(all_x0))
                     sec.right_margin = Pt(pdf_w_pt - max(all_x1))
             if not sec.top_margin:
-                sec.top_margin = Pt(72)  # 1 inch fallback
+                sec.top_margin = Pt(72)
             if not sec.bottom_margin:
                 sec.bottom_margin = Pt(72)
 
@@ -2337,6 +2433,16 @@ def build_docx(
 
     # ── 页面布局检测：从每页 block bbox 提取左边距、页宽等 ──
     # 替代所有硬编码值（82pt 左边距、595pt 页宽），支持不同版式的 PDF
+    # 从 per_page_margins 提取全局边距回退（兼容 _detect_page_layout 的接口）
+    if per_page_margins:
+        all_t = [m["top"] for m in per_page_margins.values()]
+        all_b = [m["bottom"] for m in per_page_margins.values()]
+        all_l = [m["left"] for m in per_page_margins.values()]
+        all_r = [m["right"] for m in per_page_margins.values()]
+        margins = {"top": min(all_t), "bottom": min(all_b),
+                   "left": min(all_l), "right": min(all_r)}
+    else:
+        margins = None
     _detect_page_layout(pdf_info, margins)
 
     # ── 行高兜底值（仅用于 bbox 无效的极端情况）──
@@ -2373,50 +2479,43 @@ def build_docx(
     block_count = 0
     prev_block_bottom = None  # 上一个 block 的 Y1 底部坐标
 
+    from docx.enum.section import WD_SECTION
+
     for page in pdf_info:
         page_idx = page.get("page_idx", 0)
         page_size = page.get("page_size", [595, 842])
         page_height = page_size[1] if len(page_size) > 1 else 842
         blocks = page.get("para_blocks") or page.get("blocks") or []
 
-        # 跨页处理：换页时重置 Y 坐标追踪
+        # 跳过空页（MinerU 无内容的 page_idx），避免产生空白 section
+        has_content = any(
+            any(s.get("content", "").strip()
+                for ln in (b.get("lines") or []) for s in ln.get("spans", []))
+            for b in blocks
+            if (b.get("type") or "").lower() != "table"
+        ) or any((b.get("type") or "").lower() == "table" for b in blocks)
+        if not has_content:
+            continue
+
+        # ── 每页独立 section：section break 自带翻页效果 ──
+        # 第一页用 section[0]（已在外层设置），后续页创建新 section
         if page_idx > 0:
-            prev_block_bottom = None
-
-        # 分页：在 PDF 页面边界插分页符，防止 DOCX 流式布局偏移累积。
-        # 但不能简单"每页都分页"——大表格/跨页内容会打破 MinerU page_idx
-        # 与 DOCX 物理页的一一对应，导致空页。
-        # 策略：只在该页首个 block 是"真正的页面起点"时才分页。
-        # 判据：首个有内容的 block 在页首区域（y0 < 页高 15%），且该页
-        # 没有大表格占据整页（否则 block 在表格下方，不是页面起点）。
-        if page_idx > 0 and blocks:
-            for b in blocks:
-                if b.get("_crosspage_continuation"):
-                    break  # 跨页续行，由 block 循环内的逻辑处理
-                btype = (b.get("type") or b.get("block_type") or "").lower()
-                # 表格 block 不触发分页（表格自身可能跨多页）
-                if btype == "table":
-                    break
-                lines = b.get("lines") or []
-                txt = "".join(
-                    s.get("content", "")
-                    for ln in lines for s in ln.get("spans", [])
-                ).strip()
-                if not txt:
-                    continue  # 跳过空 block
-                # 首个有内容 block 在页首 → 是页面起点 → 分页
-                bbox = b.get("bbox") or []
-                y0 = bbox[1] if len(bbox) >= 4 else page_height
-                if y0 < page_height * 0.15:
-                    _add_page_break(doc)
-                break  # 只看首个有效 block
-
+            new_sec = doc.add_section(WD_SECTION.NEW_PAGE)
+            new_sec.page_width = Mm(pdf_w_pt * 0.3528)
+            new_sec.page_height = Mm(pdf_h_pt * 0.3528)
+            # 该页独立边距
+            if per_page_margins and page_idx in per_page_margins:
+                pm = per_page_margins[page_idx]
+                new_sec.left_margin = Pt(pm["left"])
+                new_sec.right_margin = Pt(pm["right"])
+                new_sec.top_margin = Pt(pm["top"])
+                new_sec.bottom_margin = Pt(pm["bottom"])
+        prev_block_bottom = None  # 翻页后重置 Y 追踪
 
         for block in blocks:
-            # 跨页续行 block：先插分页符，强制翻页到下一页（复刻 PDF 分页）
+            # 跨页续行 block：section break 已保证新页，只需重置 Y 追踪
             if block.get("_crosspage_continuation"):
-                _add_page_break(doc)
-                prev_block_bottom = None  # 翻页后重置 Y 追踪
+                prev_block_bottom = None
 
             # 根据与上一个 block 的 Y 坐标差插入垂直留白
             bbox = block.get("bbox", [])
