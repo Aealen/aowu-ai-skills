@@ -185,10 +185,13 @@ def _detect_page_layout(
         page_center = page_width / 2
 
         # 逐页左边距：优先用 per_page_margins 的精确值，回退到全局 doc_x0
+        # 减 page_width * 0.005 补偿 DOCX 字体宽度与 PDF 内嵌字体的偏差（约 2-3%），
+        # 避免 left_indent 因舍入截断至 0 导致内容右偏。对 A4 约 3pt，肉眼不可见。
+        font_comp = page_width * 0.005
         if per_page_margins and pi in per_page_margins:
-            page_x0 = per_page_margins[pi].get("left", doc_x0)
+            page_x0 = per_page_margins[pi].get("left", doc_x0) - font_comp
         else:
-            page_x0 = doc_x0
+            page_x0 = doc_x0 - font_comp
 
         blocks = page.get("para_blocks") or page.get("blocks") or []
         for block in blocks:
@@ -2256,17 +2259,19 @@ def build_docx(
         sec.page_height = Mm(pdf_h_pt * 0.3528)
 
         # 首页边距优先用 per_page_margins，回退到全局 margins
+        # 左右边距各补偿 page_width*0.005，吸收 DOCX 字体宽度与 PDF 内嵌字体的 ~2% 偏差
+        font_comp_sec = pdf_w_pt * 0.005
         if per_page_margins and 0 in per_page_margins:
             pm = per_page_margins[0]
-            sec.left_margin = Pt(pm["left"])
-            sec.right_margin = Pt(pm["right"])
+            sec.left_margin = Pt(pm["left"] - font_comp_sec)
+            sec.right_margin = Pt(pm["right"] - font_comp_sec)
             sec.top_margin = Pt(pm["top"])
             sec.bottom_margin = Pt(pm["bottom"])
         elif per_page_margins:
             # 首页无数据，用第一个有效页的边距
             pm = next(iter(per_page_margins.values()))
-            sec.left_margin = Pt(pm["left"])
-            sec.right_margin = Pt(pm["right"])
+            sec.left_margin = Pt(pm["left"] - font_comp_sec)
+            sec.right_margin = Pt(pm["right"] - font_comp_sec)
             sec.top_margin = Pt(pm["top"])
             sec.bottom_margin = Pt(pm["bottom"])
         else:
@@ -2276,8 +2281,8 @@ def build_docx(
                 all_x0 = [b["bbox"][0] for b in first_blocks if b.get("bbox")]
                 all_x1 = [b["bbox"][2] for b in first_blocks if b.get("bbox")]
                 if all_x0 and all_x1:
-                    sec.left_margin = Pt(min(all_x0))
-                    sec.right_margin = Pt(pdf_w_pt - max(all_x1))
+                    sec.left_margin = Pt(min(all_x0) - font_comp_sec)
+                    sec.right_margin = Pt(pdf_w_pt - max(all_x1) - font_comp_sec)
             if not sec.top_margin:
                 sec.top_margin = Pt(72)
             if not sec.bottom_margin:
@@ -2722,11 +2727,12 @@ def build_docx(
                 new_sec.orientation = WD_ORIENT.PORTRAIT
             new_sec.page_width = Mm(cur_w * 0.3528)
             new_sec.page_height = Mm(cur_h * 0.3528)
-            # 该页独立边距
+            # 该页独立边距（左右各补偿 page_width*0.005，吸收字体宽度偏差）
             if per_page_margins and page_idx in per_page_margins:
                 pm = per_page_margins[page_idx]
-                new_sec.left_margin = Pt(pm["left"])
-                new_sec.right_margin = Pt(pm["right"])
+                fc = cur_w * 0.005
+                new_sec.left_margin = Pt(pm["left"] - fc)
+                new_sec.right_margin = Pt(pm["right"] - fc)
                 new_sec.top_margin = Pt(pm["top"])
                 new_sec.bottom_margin = Pt(pm["bottom"])
         prev_block_bottom = None  # 翻页后重置 Y 追踪

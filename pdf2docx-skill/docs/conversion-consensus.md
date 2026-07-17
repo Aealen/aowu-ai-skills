@@ -463,6 +463,43 @@ y1=280 就翻页了（正常页 y1≈700-760），本页 block#0 在页首（y0=
 **验证**：1.5.2 全文统一 FangSong 12pt（修复前 run1 是 SimHei 15.5pt、run2-4 无字体）；
 13 个跨页 block 续行样式全部正确。
 
+### 规则 21：Section 边距字体补偿——page_width×0.5% 每边
+
+PDF 内嵌字体与 DOCX 渲染字体（系统字体）存在约 2-3% 的字符宽度偏差（实测 FangSong
+PDF 内嵌 vs Windows FangSong 约 1.4%），相同字符数在 DOCX 中占用更多水平空间。
+此外 `left_indent = max(0, ref_x0 - page_x0)` 的整零舍入会在页左边产生 1-3pt 的"死区"。
+
+**补偿策略**：Section 的 `left_margin` 和 `right_margin` 各减去 `page_width × 0.005`（0.5%），
+同时对 `_page_x0`（用于 left_indent 计算）做相同补偿。总内容区扩展 `page_width × 1%`。
+
+| 页面尺寸 | 每边补偿 | 总扩展 | 折合中文字符 |
+|---------|---------|--------|-------------|
+| A4竖 (595pt) | 3.0pt | +6pt | ~0.6 字 |
+| A4横 (842pt) | 4.2pt | +8.4pt | ~0.8 字 |
+| A3竖 (1190pt) | 6.0pt | +12pt | ~1.2 字 |
+
+**为什么用百分比而非固定值**：
+- 字体宽度偏差是**比例性的**（如 2%），不同页宽的 PDF 需要不同的补偿绝对值
+- 固定值（如 3pt）在 A4 上合适，但在 A3 或横版上不足
+- `page_width × 0.5%` 自适应所有页面尺寸
+
+**为什么不影响居中判断**：
+- 居中判断的 `left_margin_gap > page_width × 8%` 阈值（A4≈47pt），
+  补偿量仅 3pt，远在阈值之内
+
+**为什么 `_page_x0` 也要同步补偿**：
+- `left_indent` 用 `ref_x0 - page_x0` 计算段落缩进
+- Section `left_margin` 减了 3pt 但 `_page_x0` 不变 → `left_indent` 被放大 3pt → 内容反而更偏右
+- 必须同步：Section left_margin 和 `_page_x0` 都减同一个补偿值
+
+**实现位置**（三处，均用 `page_width * 0.005`）：
+1. `_detect_page_layout` —— 注入 `_page_x0` 时
+2. 首页 section 设置 —— `sec.left_margin/right_margin`
+3. 后续页 section 设置 —— `new_sec.left_margin/right_margin`
+
+**验证**：A4 竖版内容区从 415pt→421pt（+6pt），横版从 ~700pt→~708pt（+8.4pt），
+补偿后中英文混排行不再因字体宽度差异触发额外换行。
+
 ---
 
 ## 反模式清单（禁止再次出现）
@@ -516,6 +553,7 @@ y1=280 就翻页了（正常页 y1≈700-760），本页 block#0 在页首（y0=
 | colspan用"覆盖了多少个边界点"计算 | 正常cell两端本身是边界点→每个cell都被算成colspan=2，相邻列合并，偶数列数据全丢(6个表格) | 用边界点索引差值：colspan=右边界索引-左边界索引(规则17.5) |
 | 列边界只从第一行cell收集 | 第一行是合并cell(colspan=N)时只有1个cell，列边界只有2个点→列数严重低估为1 | 遍历所有行取并集+col_count交叉验证(规则17.5) |
 | _fill_table_cells不跳过rowspan=0占位 | 合并cell的占位位置(rs=0,cs=0)被当作正常cell写入→merge后格子内容错乱 | rs=0或cs=0时c_idx+=1跳过(规则17.5) |
+| Section边距不用字体补偿 | 逐页边距精确匹配PDF但DOCX字体比PDF内嵌宽~2%，每行少1-2字符→更多换行 | 左右margin各减 page_width×0.5%，同步补偿_page_x0(规则21) |
 
 ---
 
