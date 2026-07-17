@@ -2630,6 +2630,63 @@ def build_docx(
                     if gap > 0:
                         block["_gap_after"] = gap
 
+    # ── 页面级溢出防护：DOCX 渲染时字体宽度与 PDF 不完全一致，──
+    # 段内文字可能在 DOCX 里比 PDF 多换 1-2 行。加上 EXACTLY 行距
+    # 的"行盒"效应，累积可能导致整页内容超出可用高度（实测 page21
+    # 多占 ~63pt），把末尾 block 挤到下一页成碎片页。
+    #
+    # 策略：对每页计算预估渲染高度（block 高度 + 段后间距），若超过
+    # 可用高度的 85%，等比压缩段后间距直至容纳。表格防溢出已有独立
+    # 逻辑（等比压缩行高），此处不再处理表格。
+    for page in pdf_info:
+        pi = page.get("page_idx", 0)
+        page_size = page.get("page_size", [595, 842])
+        page_h = page_size[1] if len(page_size) > 1 else 842
+        blocks = page.get("para_blocks") or page.get("blocks") or []
+        if not blocks:
+            continue
+        pm = per_page_margins.get(pi, {}) if per_page_margins else {}
+        top_m = pm.get("top", 72)
+        bot_m = pm.get("bottom", 54)
+        avail_h = page_h - top_m - bot_m - 5  # 5pt 余量
+
+        # 预估渲染高度：Σ(block bbox 高度 + _gap_after)
+        pred_h = 0.0
+        gaps: list[float] = []
+        for bi, b in enumerate(blocks):
+            bbox = b.get("bbox", [])
+            if bbox and len(bbox) >= 4:
+                pred_h += bbox[3] - bbox[1]
+            gap = b.get("_gap_after", 0) or 0
+            if gap > 0:
+                gaps.append(gap)
+                pred_h += gap
+
+        if pred_h <= 0 or pred_h <= avail_h * 0.85:
+            continue  # 不需要压缩
+
+        # 需要压缩段后间距：计算目标总高 = avail_h×0.90（留余量）
+        target_h = avail_h * 0.90
+        excess = pred_h - target_h
+        total_gap = sum(gaps)
+        if total_gap <= 0 or excess <= 0:
+            continue
+
+        # 等比压缩所有段后间距
+        scale = max(0.0, (total_gap - excess) / total_gap)
+        min_gap = 3.0  # 段后间距不低于 3pt，避免段落粘连
+        saved = 0.0
+        for bi, b in enumerate(blocks):
+            old_gap = b.get("_gap_after", 0) or 0
+            if old_gap <= 0:
+                continue
+            new_gap = round(max(min_gap, old_gap * scale))
+            b["_gap_after"] = new_gap
+            saved += old_gap - new_gap
+        if saved > 1:
+            print(f"  📏 第{pi+1}页防溢出: 段后间距压缩 {saved:.0f}pt "
+                  f"(预估{excess:.0f}pt溢出)", file=sys.stderr)
+
     block_count = 0
     prev_block_bottom = None  # 上一个 block 的 Y1 底部坐标
 
