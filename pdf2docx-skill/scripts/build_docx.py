@@ -185,9 +185,10 @@ def _detect_page_layout(
         page_center = page_width / 2
 
         # 逐页左边距：优先用 per_page_margins 的精确值，回退到全局 doc_x0
-        # 减 page_width * 0.005 补偿 DOCX 字体宽度与 PDF 内嵌字体的偏差（约 2-3%），
-        # 避免 left_indent 因舍入截断至 0 导致内容右偏。对 A4 约 3pt，肉眼不可见。
-        font_comp = page_width * 0.005
+        # 减 page_width * 0.014 补偿 DOCX 字体宽度与 PDF 内嵌字体的偏差（实测 ~1.4%，
+        # 与规则17表格列宽补偿系数一致），避免 left_indent 舍入截断 + 中英混排行换行。
+        # 对 A4 约 8.3pt，纯中文行略有裕度，中英混排行刚好放得下。
+        font_comp = page_width * 0.014
         if per_page_margins and pi in per_page_margins:
             page_x0 = per_page_margins[pi].get("left", doc_x0) - font_comp
         else:
@@ -2259,8 +2260,8 @@ def build_docx(
         sec.page_height = Mm(pdf_h_pt * 0.3528)
 
         # 首页边距优先用 per_page_margins，回退到全局 margins
-        # 左右边距各补偿 page_width*0.005，吸收 DOCX 字体宽度与 PDF 内嵌字体的 ~2% 偏差
-        font_comp_sec = pdf_w_pt * 0.005
+        # 左右边距各补偿 page_width*0.014（与规则17同系数），吸收字体宽度偏差
+        font_comp_sec = pdf_w_pt * 0.014
         if per_page_margins and 0 in per_page_margins:
             pm = per_page_margins[0]
             sec.left_margin = Pt(pm["left"] - font_comp_sec)
@@ -2727,10 +2728,10 @@ def build_docx(
                 new_sec.orientation = WD_ORIENT.PORTRAIT
             new_sec.page_width = Mm(cur_w * 0.3528)
             new_sec.page_height = Mm(cur_h * 0.3528)
-            # 该页独立边距（左右各补偿 page_width*0.005，吸收字体宽度偏差）
+            # 该页独立边距（左右各补偿 page_width*0.014，吸收字体宽度偏差）
             if per_page_margins and page_idx in per_page_margins:
                 pm = per_page_margins[page_idx]
-                fc = cur_w * 0.005
+                fc = cur_w * 0.014
                 new_sec.left_margin = Pt(pm["left"] - fc)
                 new_sec.right_margin = Pt(pm["right"] - fc)
                 new_sec.top_margin = Pt(pm["top"])

@@ -463,42 +463,38 @@ y1=280 就翻页了（正常页 y1≈700-760），本页 block#0 在页首（y0=
 **验证**：1.5.2 全文统一 FangSong 12pt（修复前 run1 是 SimHei 15.5pt、run2-4 无字体）；
 13 个跨页 block 续行样式全部正确。
 
-### 规则 21：Section 边距字体补偿——page_width×0.5% 每边
+### 规则 21：Section 边距字体补偿——page_width×1.4% 每边
 
-PDF 内嵌字体与 DOCX 渲染字体（系统字体）存在约 2-3% 的字符宽度偏差（实测 FangSong
-PDF 内嵌 vs Windows FangSong 约 1.4%），相同字符数在 DOCX 中占用更多水平空间。
+PDF 内嵌字体与 DOCX 渲染字体（系统字体）存在字符宽度偏差（实测 FangSong ~1.43%，
+TimesNewRoman ~1.42%，与规则 17 表格列宽补偿数据一致）。相同文本在 DOCX 中占用
+更多水平空间，中英文混排行（如中文 + 英文数字 "WIN7"）偏差尤为明显。
 此外 `left_indent = max(0, ref_x0 - page_x0)` 的整零舍入会在页左边产生 1-3pt 的"死区"。
 
-**补偿策略**：Section 的 `left_margin` 和 `right_margin` 各减去 `page_width × 0.005`（0.5%），
-同时对 `_page_x0`（用于 left_indent 计算）做相同补偿。总内容区扩展 `page_width × 1%`。
+**补偿策略**：Section 的 `left_margin` 和 `right_margin` 各减去 `page_width × 0.014`（1.4%），
+同时对 `_page_x0`（用于 left_indent 计算）做相同补偿。总内容区扩展 `page_width × 2.8%`。
+与规则 17 表格列宽补偿系数统一，保持设计一致性。
 
 | 页面尺寸 | 每边补偿 | 总扩展 | 折合中文字符 |
 |---------|---------|--------|-------------|
-| A4竖 (595pt) | 3.0pt | +6pt | ~0.6 字 |
-| A4横 (842pt) | 4.2pt | +8.4pt | ~0.8 字 |
-| A3竖 (1190pt) | 6.0pt | +12pt | ~1.2 字 |
+| A4竖 (595pt) | 8.3pt | +16.7pt | ~1.7 字 |
+| A4横 (842pt) | 11.8pt | +23.6pt | ~2.4 字 |
+| A3竖 (1190pt) | 16.7pt | +33.3pt | ~3.3 字 |
 
-**为什么用百分比而非固定值**：
-- 字体宽度偏差是**比例性的**（如 2%），不同页宽的 PDF 需要不同的补偿绝对值
-- 固定值（如 3pt）在 A4 上合适，但在 A3 或横版上不足
-- `page_width × 0.5%` 自适应所有页面尺寸
-
-**为什么不影响居中判断**：
-- 居中判断的 `left_margin_gap > page_width × 8%` 阈值（A4≈47pt），
-  补偿量仅 3pt，远在阈值之内
+**为什么用 1.4% 而非较低值**：
+- 0.5% 对纯中文基本够用，但中英文混排行（含英文/数字）偏差达 3-4%，"上"字被挤到下行
+- 1.4% 覆盖已知最大字体偏差（TimesNewRoman 1.42%），中英混排行刚好放得下
+- 与规则 17 表格补偿系数一致，保持代码设计统一性
+- 对纯中文行有 ~4pt 裕度，排版略显宽松但不可见
 
 **为什么 `_page_x0` 也要同步补偿**：
 - `left_indent` 用 `ref_x0 - page_x0` 计算段落缩进
-- Section `left_margin` 减了 3pt 但 `_page_x0` 不变 → `left_indent` 被放大 3pt → 内容反而更偏右
+- Section `left_margin` 减了补偿但 `_page_x0` 不变 → `left_indent` 被放大 → 内容反而更偏右
 - 必须同步：Section left_margin 和 `_page_x0` 都减同一个补偿值
 
-**实现位置**（三处，均用 `page_width * 0.005`）：
+**实现位置**（三处，均用 `page_width * 0.014`）：
 1. `_detect_page_layout` —— 注入 `_page_x0` 时
 2. 首页 section 设置 —— `sec.left_margin/right_margin`
 3. 后续页 section 设置 —— `new_sec.left_margin/right_margin`
-
-**验证**：A4 竖版内容区从 415pt→421pt（+6pt），横版从 ~700pt→~708pt（+8.4pt），
-补偿后中英文混排行不再因字体宽度差异触发额外换行。
 
 ---
 
