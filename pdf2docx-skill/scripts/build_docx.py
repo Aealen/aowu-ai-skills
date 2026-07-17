@@ -1407,8 +1407,15 @@ def _build_table(doc, block: dict[str, Any]) -> None:
             table_lh = block.get("_table_line_height") or block.get("_doc_line_height")
             row_line_heights = block.get("_table_row_line_heights")
             row_heights = block.get("_table_row_heights")
-            if row_heights and len(row_heights) == len(table.rows):
-                _set_table_row_heights(table, row_heights, rule="atLeast")
+            if row_heights:
+                if len(row_heights) == len(table.rows):
+                    _set_table_row_heights(table, row_heights, rule="atLeast")
+                elif len(row_heights) > 0:
+                    # 行数不匹配（MinerU HTML 行数 ≠ PyMuPDF 行数）：
+                    # 按总高度等比分配到每行
+                    total_h = sum(row_heights)
+                    avg_h = total_h / len(table.rows)
+                    _set_table_row_heights(table, [avg_h] * len(table.rows), rule="atLeast")
 
             _fill_table_cells(table, rows, block.get("_style"), table_lh, row_line_heights,
                               block.get("_table_cell_styles"))
@@ -2051,18 +2058,29 @@ def _detect_per_page_margins(
         if not y0s:
             continue  # 空页跳过
 
+        # 判断是否纯表格页：MinerU 数据中该页只有 table block
+        mu_page = next((p for p in pdf_info if isinstance(p, dict) and p.get("page_idx") == pi), {})
+        mu_blocks = mu_page.get("para_blocks") or mu_page.get("blocks") or []
+        is_table_only = bool(mu_blocks) and all(
+            (b.get("type") or "").lower() == "table" for b in mu_blocks
+        )
+
         top_min = min(y0s)
         bottom_max = max(y1s)
         left_min = min(x0s)
         right_max = max(x1s)
         try:
-            for tab in fpage.find_tables().tables:
-                if tab.bbox[1] >= ph - 60:
-                    continue
-                # 上下边距合并表格 bbox
-                top_min = min(top_min, tab.bbox[1])
-                bottom_max = max(bottom_max, tab.bbox[3])
-                # 左右边距不合并表格 bbox
+            tab_bboxes = [tab.bbox for tab in fpage.find_tables().tables
+                          if tab.bbox[1] < ph - 60]
+            for tb in tab_bboxes:
+                top_min = min(top_min, tb[1])
+                bottom_max = max(bottom_max, tb[3])
+            # 纯表格页（MinerU 只有 table block）：左右边距用表格 bbox
+            # 否则少数正文 span 位置会给出偏大的边距（如标题居中 left=188）
+            if is_table_only and tab_bboxes:
+                for tb in tab_bboxes:
+                    left_min = min(left_min, tb[0])
+                    right_max = max(right_max, tb[2])
         except Exception:
             pass
 
@@ -2132,7 +2150,12 @@ def build_docx(
         pdf_h_pt = page_size[1] if len(page_size) > 1 else 842
 
         sec = doc.sections[0]
-        # pt → mm（1pt = 0.3528mm）
+        # 方向判断（支持横版首页）
+        from docx.enum.section import WD_ORIENT
+        if pdf_w_pt > pdf_h_pt:
+            sec.orientation = WD_ORIENT.LANDSCAPE
+        else:
+            sec.orientation = WD_ORIENT.PORTRAIT
         sec.page_width = Mm(pdf_w_pt * 0.3528)
         sec.page_height = Mm(pdf_h_pt * 0.3528)
 
@@ -2230,17 +2253,17 @@ def build_docx(
                         # 行高和 cell 内文字行高（从 PDF 原始数据提取）
                         row_heights, text_lh, row_lhs = _extract_table_row_geometry(mtable, fitz_page)
                         if row_heights:
-                            # 防溢出：若 table 行高总和接近页面高度，WPS 渲染时
-                            # 表格边框+内边距+分页符段落会超出可用空间，导致最后一行
-                            # 被挤到下一页单独显示。检测到接近页满时，等比压缩行高。
-                            # 阈值：总高 > 页高 × 0.80（A4 约 673pt），预留 20% 给边距+渲染开销。
+                            # 防溢出：表格总高超过该页可用高度时等比压缩。
+                            # 用该页的实际边距（从 per_page_margins 获取），而非全局默认值。
                             total_h = sum(row_heights)
                             page_h = fitz_page.rect.height
-                            max_table_h = page_h * 0.80
-                            if total_h > max_table_h:
-                                scale = max_table_h / total_h
+                            pm = per_page_margins.get(pi, {}) if per_page_margins else {}
+                            top_m = pm.get("top", 72)
+                            bot_m = pm.get("bottom", 54)
+                            avail_h = page_h - top_m - bot_m - 30  # 5pt 渲染余量
+                            if total_h > avail_h:
+                                scale = avail_h / total_h
                                 row_heights = [round(h * scale, 1) for h in row_heights]
-                                # cell 内行距同步压缩，保持行高与行距比例一致
                                 row_lhs = [round(lh * scale, 1) if lh else None
                                            for lh in row_lhs]
                             block["_table_row_heights"] = row_heights
@@ -2307,12 +2330,13 @@ def build_docx(
                                 look_block["_table_cell_styles"] = cs
                             rh, tlh, row_lhs = _extract_table_row_geometry(mtable, fitz_page)
                             if rh:
-                                # 防溢出：同主 block 逻辑，接近页满时等比压缩行高
+                                # 防溢出：同主 block 逻辑，用该页实际边距
                                 total_h = sum(rh)
                                 page_h = fitz_page.rect.height
-                                max_table_h = page_h * 0.80
-                                if total_h > max_table_h:
-                                    scale = max_table_h / total_h
+                                pm = per_page_margins.get(look_idx, {}) if per_page_margins else {}
+                                avail_h = page_h - pm.get("top", 72) - pm.get("bottom", 54) - 30
+                                if total_h > avail_h:
+                                    scale = avail_h / total_h
                                     rh = [round(h * scale, 1) for h in rh]
                                     row_lhs = [round(lh * scale, 1) if lh else None
                                                for lh in row_lhs]
@@ -2382,12 +2406,13 @@ def build_docx(
                     if widths:
                         new_block["_col_widths"] = widths
                     if row_heights:
-                        # 防溢出：同主 block 逻辑，接近页满时等比压缩行高
+                        # 防溢出：同主 block 逻辑，用该页实际边距
                         total_h = sum(row_heights)
                         page_h = fitz_page.rect.height
-                        max_table_h = page_h * 0.80
-                        if total_h > max_table_h:
-                            scale = max_table_h / total_h
+                        ppm = per_page_margins.get(pi, {}) if per_page_margins else {}
+                        avail_h = page_h - ppm.get("top", 72) - ppm.get("bottom", 54) - 30
+                        if total_h > avail_h:
+                            scale = avail_h / total_h
                             row_heights = [round(h * scale, 1) for h in row_heights]
                             row_lhs = [round(lh * scale, 1) if lh else None
                                        for lh in row_lhs]
@@ -2499,10 +2524,18 @@ def build_docx(
 
         # ── 每页独立 section：section break 自带翻页效果 ──
         # 第一页用 section[0]（已在外层设置），后续页创建新 section
+        # 用当前页的 page_size（支持横版页），而非首页全局值
         if page_idx > 0:
+            from docx.enum.section import WD_ORIENT
             new_sec = doc.add_section(WD_SECTION.NEW_PAGE)
-            new_sec.page_width = Mm(pdf_w_pt * 0.3528)
-            new_sec.page_height = Mm(pdf_h_pt * 0.3528)
+            cur_w = page_size[0] if len(page_size) > 0 else 595
+            cur_h = page_size[1] if len(page_size) > 1 else 842
+            if cur_w > cur_h:  # 横版页
+                new_sec.orientation = WD_ORIENT.LANDSCAPE
+            else:
+                new_sec.orientation = WD_ORIENT.PORTRAIT
+            new_sec.page_width = Mm(cur_w * 0.3528)
+            new_sec.page_height = Mm(cur_h * 0.3528)
             # 该页独立边距
             if per_page_margins and page_idx in per_page_margins:
                 pm = per_page_margins[page_idx]
