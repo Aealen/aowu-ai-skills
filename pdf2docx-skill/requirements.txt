@@ -14,3 +14,6 @@ PyMuPDF
 
 # python-docx —— DOCX 重建
 python-docx
+
+# MinIO 对象存储 SDK —— 下载源文件 / 上传转换结果
+minio>=7.2.0

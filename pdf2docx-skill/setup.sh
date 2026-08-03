@@ -58,6 +58,7 @@ echo "--- Python Packages ---"
 PY_PKGS=(
     "fitz:PyMuPDF"
     "docx:python-docx"
+    "minio:minio"
 )
 
 MISSING_PY=()
@@ -105,6 +106,23 @@ else
     info "  PowerShell: [Environment]::SetEnvironmentVariable('MINERU_MODEL_SOURCE','modelscope','User')"
 fi
 
+# MinIO 环境变量（MinIO 模式必填,本地路径模式不需要）
+echo ""
+echo "--- MinIO 环境变量（MinIO 模式必填,本地模式不需要）---"
+MINIO_REQUIRED=("MINIO_ENDPOINT" "MINIO_ACCESS_KEY" "MINIO_SECRET_KEY" "MINIO_BUCKET")
+MINIO_MISSING=()
+for var in "${MINIO_REQUIRED[@]}"; do
+    if [ -z "${!var:-}" ]; then
+        MINIO_MISSING+=("$var")
+    fi
+done
+if [ ${#MINIO_MISSING[@]} -gt 0 ]; then
+    warn "MinIO env 未设置: ${MINIO_MISSING[*]} (仅影响 --minio-input/--minio-output)"
+    info "本地路径模式不需要 MinIO env"
+else
+    ok "MinIO env 已配置(本地模式可忽略)"
+fi
+
 if [ ${#MISSING_PY[@]} -gt 0 ]; then
     echo ""
     if [ -t 0 ]; then
@@ -137,6 +155,21 @@ if python3 -c "import mineru" 2>/dev/null || python3 -c "import magic_pdf" 2>/de
     info "首次转换 PDF 时会自动下载，但建议提前执行以避免转换时等待"
 else
     warn "MinerU 未安装，模型权重检查跳过"
+fi
+
+# ── 5. 共享缓存初始化（沙箱环境）──
+echo ""
+echo "--- 共享缓存（沙箱环境）---"
+if [ -n "${SHARED_DIR:-}" ]; then
+    info "SHARED_DIR=${SHARED_DIR} 已设置，初始化共享缓存..."
+    if python3 "$SCRIPT_DIR/scripts/env_setup.py"; then
+        ok "共享缓存就绪（后续转换用输出的 SHARED_VENV_PY 执行）"
+    else
+        fail "共享缓存初始化失败（可忽略，将使用本地模式）"
+    fi
+else
+    info "SHARED_DIR 未设置 → 本地模式（每个沙箱独立安装依赖）"
+    info "沙箱环境建议: 平台注入 SHARED_DIR 指向共享目录，避免每次冷启动重下 ~4GB"
 fi
 
 # ── Summary ──

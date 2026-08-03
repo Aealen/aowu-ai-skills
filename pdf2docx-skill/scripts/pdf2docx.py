@@ -27,6 +27,8 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+import tempfile
+from datetime import datetime, timezone
 from pathlib import Path
 
 # 确保能 import 同目录下的模块
@@ -58,6 +60,7 @@ def cmd_env_check(args) -> None:
     py_deps = [
         ("fitz", "PyMuPDF", "pip install PyMuPDF"),
         ("docx", "python-docx", "pip install python-docx"),
+        ("minio", "minio", "pip install minio>=7.2.0"),
     ]
     all_ok = py_ok
 
@@ -94,16 +97,135 @@ def cmd_env_check(args) -> None:
 
 
 # ═══════════════════════════════════════════════════════════════
+#  MinIO 辅助函数
+# ═══════════════════════════════════════════════════════════════
+
+def _load_minio_spec(inline, file_path):
+    """
+    解析 minio 输入/输出 JSON spec。
+    inline: --minio-input 的值(内联 JSON 字符串,或 '-' 表 stdin)
+    file_path: --minio-input-file 的值
+    返回: dict 或 None(都未给)。出错 sys.exit(5)。
+    """
+    if inline is not None and file_path is not None:
+        print("✗ 不能同时指定内联 JSON(--minio-input)和文件(--minio-input-file)",
+              file=sys.stderr)
+        sys.exit(5)
+    if inline is not None:
+        raw = sys.stdin.read() if inline == "-" else inline
+    elif file_path is not None:
+        raw = Path(file_path).read_text(encoding="utf-8")
+    else:
+        return None
+    try:
+        spec = json.loads(raw)
+    except json.JSONDecodeError as e:
+        print(f"✗ JSON 解析失败: {e}", file=sys.stderr)
+        sys.exit(5)
+    if not isinstance(spec, dict):
+        print("✗ MinIO spec 必须是 JSON 对象", file=sys.stderr)
+        sys.exit(5)
+    return spec
+
+
+def _print_error_json(code, message):
+    """stdout 打错误 JSON,供 agent 解析。"""
+    print(json.dumps({
+        "status": "error",
+        "code": code,
+        "message": message,
+    }, ensure_ascii=False))
+
+
+def _derive_output_key(input_object_key, fallback_name):
+    """
+    从输入 object_key 推导输出 key:同目录 + 换扩展名 .pdf -> .docx。
+    input_object_key 为 None 时用 fallback_name 放 generation/demo/ 下。
+    """
+    if input_object_key:
+        p = Path(input_object_key)
+        return str(p.with_suffix(".docx"))
+    return f"generation/demo/{Path(fallback_name).stem}.docx"
+
+
+def _build_upload_metadata(spec, input_meta):
+    """组装上传 metadata:spec.metadata + 溯源默认值 + 输入端 metadata。"""
+    metadata = dict(spec.get("metadata") or {})
+    metadata.setdefault("converted_from", "pdf")
+    metadata.setdefault("converter", "pdf2docx-skill")
+    metadata.setdefault("converted_at", datetime.now(timezone.utc).isoformat())
+    for k, v in (input_meta or {}).items():
+        metadata.setdefault(k, v)
+    return metadata
+
+
+# ═══════════════════════════════════════════════════════════════
 #  convert 子命令（一键全流程）
 # ═══════════════════════════════════════════════════════════════
 
 def cmd_convert(args) -> None:
-    """一键全流程：PDF → DOCX。"""
-    pdf_path = Path(args.pdf).resolve()
-    output_path = Path(args.output).resolve()
+    """一键全流程：PDF → DOCX。支持本地或 MinIO 输入输出。"""
+    # ── 解析 MinIO spec ──
+    minio_input_spec = _load_minio_spec(
+        getattr(args, "minio_input", None),
+        getattr(args, "minio_input_file", None),
+    )
+    minio_output_spec = _load_minio_spec(
+        getattr(args, "minio_output", None),
+        getattr(args, "minio_output_file", None),
+    )
+
+    # ── 确定 PDF 输入 ──
+    temp_dirs = []          # 待清理的 temp 目录
+    downloaded_key = None   # MinIO 下载的 object_key(推导输出 key 用)
+    input_meta = {}
+
+    if minio_input_spec is not None:
+        if args.pdf is not None:
+            print("✗ 不能同时指定本地 PDF 路径和 --minio-input", file=sys.stderr)
+            sys.exit(5)
+        from minio_client import MinioClient, MinioConfigError
+        try:
+            client = MinioClient()
+        except MinioConfigError as e:
+            print(f"✗ {e}", file=sys.stderr)
+            _print_error_json(2, str(e))
+            sys.exit(2)
+        dl_dir = Path(tempfile.mkdtemp(prefix="pdf2docx_dl_"))
+        temp_dirs.append(dl_dir)
+        try:
+            pdf_path, input_meta = client.download(minio_input_spec, dl_dir)
+        except (RuntimeError, ValueError) as e:
+            print(f"✗ {e}", file=sys.stderr)
+            _print_error_json(3, str(e))
+            sys.exit(3)
+        pdf_path = pdf_path.resolve()
+        # 解析实际下载的 object_key(用于 JSON 报告,覆盖 URL/str/dict 全形式)
+        downloaded_key, _ = client._resolve_object_key(minio_input_spec)
+    else:
+        if args.pdf is None:
+            print("✗ 必须提供 PDF 路径(位置参数)或 --minio-input", file=sys.stderr)
+            sys.exit(5)
+        pdf_path = Path(args.pdf).resolve()
+        if not pdf_path.exists():
+            print(f"✗ 输入文件不存在: {pdf_path}", file=sys.stderr)
+            sys.exit(1)
+
+    # ── 确定输出路径 ──
+    keep_local_output = args.output is not None
+    if minio_output_spec is not None and args.output is None:
+        # 只上传,产出到 temp
+        out_dir = Path(tempfile.mkdtemp(prefix="pdf2docx_out_"))
+        temp_dirs.append(out_dir)
+        output_path = out_dir / "output.docx"
+    elif args.output is not None:
+        output_path = Path(args.output).resolve()
+    else:
+        print("✗ 必须提供 -o/--output 或 --minio-output", file=sys.stderr)
+        sys.exit(5)
+
     work_dir = Path(args.work_dir).resolve() if args.work_dir \
         else output_path.parent / f"_pdf2docx_work_{pdf_path.stem}"
-
     work_dir.mkdir(parents=True, exist_ok=True)
 
     print(f"═══════════════════════════════════════════════", file=sys.stderr)
@@ -111,11 +233,11 @@ def cmd_convert(args) -> None:
     print(f"  输入: {pdf_path}", file=sys.stderr)
     print(f"  输出: {output_path}", file=sys.stderr)
     print(f"  中间产物: {work_dir}", file=sys.stderr)
+    if downloaded_key:
+        print(f"  MinIO 下载: {downloaded_key}", file=sys.stderr)
+    if minio_output_spec is not None:
+        print(f"  MinIO 上传: 已启用", file=sys.stderr)
     print(f"═══════════════════════════════════════════════\n", file=sys.stderr)
-
-    if not pdf_path.exists():
-        print(f"✗ 输入文件不存在: {pdf_path}", file=sys.stderr)
-        sys.exit(1)
 
     # ── Step 1: MinerU 解析（同步 API，进程内设环境变量）──
     from parse_mineru import parse_with_mineru
@@ -169,6 +291,7 @@ def cmd_convert(args) -> None:
 
     # 输出 JSON 结果（供程序化调用）
     result = {
+        "status": "success",
         "output": result_path,
         "stats": {
             "spans_total": len(spans),
@@ -177,7 +300,48 @@ def cmd_convert(args) -> None:
             "align_rate": round(rate, 1),
         },
     }
+
+    # ── MinIO 上传(如启用)──
+    if minio_output_spec is not None:
+        from minio_client import MinioClient, MinioConfigError
+        try:
+            up_client = MinioClient()
+        except MinioConfigError as e:
+            print(f"✗ {e}", file=sys.stderr)
+            _print_error_json(2, str(e))
+            sys.exit(2)
+        upload_key = minio_output_spec.get("object_key") or \
+            _derive_output_key(downloaded_key, pdf_path.name)
+        content_type = minio_output_spec.get("content_type")
+        metadata = _build_upload_metadata(minio_output_spec, input_meta)
+        try:
+            uploaded_info = up_client.upload(
+                result_path, upload_key,
+                content_type=content_type, metadata=metadata,
+            )
+            print(f"  ✅ MinIO 上传成功: {uploaded_info['key']}", file=sys.stderr)
+        except (RuntimeError, FileNotFoundError) as e:
+            print(f"✗ {e}", file=sys.stderr)
+            _print_error_json(4, str(e))
+            sys.exit(4)
+        # 只上传模式(无 -o):删 temp 输出
+        if not keep_local_output and not args.keep_work:
+            Path(result_path).unlink(missing_ok=True)
+        result["minio"] = {
+            "downloaded_key": downloaded_key,
+            "uploaded_key": uploaded_info["key"],
+            "uploaded_url": uploaded_info["url"],
+            "uploaded_size": uploaded_info["size"],
+            "metadata_written": metadata,
+        }
+
     print(json.dumps(result, ensure_ascii=False, indent=2))
+
+    # ── 成功后清 temp 目录(失败则保留供排查)──
+    if not args.keep_work:
+        import shutil
+        for d in temp_dirs:
+            shutil.rmtree(d, ignore_errors=True)
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -275,22 +439,34 @@ def main():
 
     # ── convert ──
     p_conv = sub.add_parser("convert", help="一键全流程：PDF → DOCX")
-    p_conv.add_argument("pdf", help="输入 PDF 路径")
-    p_conv.add_argument("-o", "--output", required=True, help="输出 docx 路径")
+    p_conv.add_argument("pdf", nargs="?", default=None,
+                        help="输入 PDF 路径(本地模式);MinIO 模式省略")
+    p_conv.add_argument("-o", "--output", default=None,
+                        help="输出 docx 路径;MinIO-only 模式可省略")
     p_conv.add_argument("--work-dir", default=None,
-                        help="中间产物目录（默认在输出旁边）")
+                        help="中间产物目录(默认在输出旁边)")
     p_conv.add_argument("--keep-work", action="store_true",
-                        help="保留中间产物（默认清理）")
+                        help="保留中间产物(默认清理)")
     p_conv.add_argument("-m", "--method", default="auto",
                         choices=["auto", "txt", "ocr"],
-                        help="解析方法（auto=自动判断）")
+                        help="解析方法(auto=自动判断)")
     p_conv.add_argument("-l", "--lang", default="ch", help="语言")
     p_conv.add_argument("--no-formula", action="store_true",
-                        help="关闭公式识别（加快速度）")
+                        help="关闭公式识别(加快速度)")
     p_conv.add_argument("--no-table", action="store_true",
-                        help="关闭表格识别（加快速度）")
+                        help="关闭表格识别(加快速度)")
     p_conv.add_argument("--iou", type=float, default=0.3,
-                        help="bbox 对齐 IoU 阈值（默认 0.3）")
+                        help="bbox 对齐 IoU 阈值(默认 0.3)")
+    # MinIO 输入
+    p_conv.add_argument("--minio-input", default=None,
+                        help="MinIO 输入 JSON(内联;'-' 表 stdin)")
+    p_conv.add_argument("--minio-input-file", default=None,
+                        help="MinIO 输入 JSON 文件路径")
+    # MinIO 输出
+    p_conv.add_argument("--minio-output", default=None,
+                        help="MinIO 输出 JSON(内联;'-' 表 stdin)")
+    p_conv.add_argument("--minio-output-file", default=None,
+                        help="MinIO 输出 JSON 文件路径")
     p_conv.set_defaults(func=cmd_convert)
 
     # ── env.check ──

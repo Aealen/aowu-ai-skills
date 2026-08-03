@@ -76,6 +76,127 @@ python3 "$SKILL_DIR/scripts/pdf2docx.py" inspect input.pdf -v
 python3 "$SKILL_DIR/scripts/pdf_inspect.py" middle <middle.json路径>
 ```
 
+## MinIO 集成（从对象存储读写）
+
+支持直接从 MinIO 下载源 PDF、转换后上传 DOCX。MinIO 连接信息全部走环境变量，
+缺失即报错（本地路径模式不需要 MinIO env）。
+
+### 环境变量（MinIO 模式必填）
+
+| 变量 | 说明 |
+|------|------|
+| `MINIO_ENDPOINT` | MinIO 地址，如 `http://127.0.0.1:9000` |
+| `MINIO_ACCESS_KEY` | 访问密钥 |
+| `MINIO_SECRET_KEY` | 秘密密钥 |
+| `MINIO_BUCKET` | bucket 名 |
+| `MINIO_PUBLIC_URL` | 可选，对外 URL；配了才能用 URL 形式传 `--minio-input` |
+
+> **env 缺失行为**：必填项任一缺失，立即抛 `MinioConfigError`，退出码 2，
+> stdout 输出 `{"status":"error","code":2,...}`。外部 Agent 读 stderr/stdout
+> 即可判断"未配 MinIO"。源码不内置任何默认连接信息。
+
+### 用法
+
+```bash
+# 1. 内联 JSON（短 spec）
+python3 "$SKILL_DIR/scripts/pdf2docx.py" convert \
+  --minio-input '{"object_key":"generation/demo/x.pdf"}' \
+  --minio-output '{"object_key":"generation/demo/x.docx"}'
+
+# 2. 文件 JSON（长 spec，避 shell 转义）
+python3 "$SKILL_DIR/scripts/pdf2docx.py" convert \
+  --minio-input-file input.json \
+  --minio-output-file output.json
+
+# 3. stdin（agent 管道注入）
+cat input.json | python3 "$SKILL_DIR/scripts/pdf2docx.py" convert \
+  --minio-input - --minio-output-file output.json
+
+# 4. URL 形式输入（需 MINIO_PUBLIC_URL 已配）
+python3 "$SKILL_DIR/scripts/pdf2docx.py" convert \
+  --minio-input '{"url":"http://domain/upload/tender/generation/demo/x.pdf"}' \
+  --minio-output '{"object_key":"generation/demo/x.docx"}'
+
+# 5. 混用：本地 PDF → 上传 MinIO
+python3 "$SKILL_DIR/scripts/pdf2docx.py" convert input.pdf \
+  --minio-output '{"object_key":"generation/demo/output.docx"}'
+```
+
+### JSON Schema
+
+**输入**（`--minio-input`）：
+```json
+{
+  "url": "http://.../tender/generation/demo/x.pdf",
+  "object_key": "generation/demo/x.pdf",
+  "filename": "招标文件.pdf",
+  "metadata": {"file_id": "abc", "source": "tender-parse"}
+}
+```
+- `url`/`object_key` 二选一（都给则 `object_key` 优先）
+- `metadata` 透传到转换日志和返回值，**不落 MinIO 对象**
+
+**输出**（`--minio-output`）：
+```json
+{
+  "object_key": "generation/demo/x.docx",
+  "content_type": "application/vnd...wordprocessingml.document",
+  "metadata": {"file_id": "abc", "converted_from": "pdf"}
+}
+```
+- `object_key` 可省略（自动推导：输入同目录 + `.pdf→.docx`）
+- `metadata` **写入 MinIO 对象 header**（`x-amz-meta-*`），下游 `stat_object` 可读
+- 自动注入溯源字段：`converter`、`converted_from`、`converted_at`
+
+### 退出码
+
+| code | 场景 |
+|------|------|
+| 0 | 成功 |
+| 1 | 转换本身失败 |
+| 2 | MinIO env 缺失 |
+| 3 | 下载失败 |
+| 4 | 上传失败 |
+| 5 | JSON 解析/参数校验失败 |
+
+完整设计文档：`docs/2026-08-03-minio-integration-design.md`
+
+## 共享缓存协议（沙箱环境）
+
+沙箱容器每次冷启动会重新下载 ~4GB（依赖 1.5GB + MinerU 模型 2.5GB），
+准备环境耗时 5-15 分钟。若平台支持**共享目录**（注入环境变量 `SHARED_DIR`
+并读写挂载进所有沙箱），本 Skill 自动复用全局缓存，秒级启动。
+
+**平台配置（一次性）**：
+- 注入环境变量 `SHARED_DIR=/共享目录根路径`（所有沙箱同一路径）
+- 将共享目录读写挂载进所有沙箱容器
+
+**共享目录布局**（Skill 自动维护，无需人工干预）：
+```
+$SHARED_DIR/pdf2docx/
+  venv-<hash>/       完整 venv（依赖，hash = requirements 内容哈希）
+  modelscope/        MinerU 模型缓存
+  cache/uv/          uv 构建缓存
+  manifest.json      版本指针（Skill 更新自动触发重建）
+  .lock              并发锁文件
+```
+
+**使用流程**（每次转换前必跑，幂等）：
+```bash
+python3 "$SKILL_DIR/scripts/env_setup.py"
+```
+- 成功 → stdout 输出 `SHARED_VENV_PY=...` 和 `MODELSCOPE_CACHE=...`
+- 后续命令用共享 venv 执行：
+  ```bash
+  "$SHARED_VENV_PY" "$SKILL_DIR/scripts/pdf2docx.py" convert input.pdf -o output.docx
+  ```
+- 未设置 `SHARED_DIR` 或平台不支持共享锁（flock）→ 自动降级本地模式
+  （现有 `uv run python` 流程）
+
+**并发安全**：多沙箱同时首启，仅第一个执行初始化（flock 锁 + double-check），
+其余等待后直接复用，无重复下载。版本变更自动重建新 venv（哈希目录原子切换），
+旧版本保留最近 2 个后清理。
+
 ## 处理流程（四步管线）
 
 ```
